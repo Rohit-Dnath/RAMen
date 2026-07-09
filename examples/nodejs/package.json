@@ -1,0 +1,13 @@
+{
+  "name": "ramen-nodejs-example",
+  "private": true,
+  "version": "1.0.0",
+  "description": "RAMen client example using node-redis",
+  "main": "basic_client.js",
+  "scripts": {
+    "start": "node basic_client.js"
+  },
+  "dependencies": {
+    "redis": "^4.7.0"
+  }
+}

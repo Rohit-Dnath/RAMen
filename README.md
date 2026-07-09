@@ -84,6 +84,10 @@ ramen: dashboard on http://localhost:8080
 
 That is it. RAMen is now running on port 6379, and a live dashboard is at http://localhost:8080.
 
+## Client examples
+
+- [Node.js (node-redis)](examples/nodejs/README.md)
+
 ## How to use it
 
 ### Talk to it like Redis
