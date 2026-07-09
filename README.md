@@ -84,6 +84,10 @@ ramen: dashboard on http://localhost:8080
 
 That is it. RAMen is now running on port 6379, and a live dashboard is at http://localhost:8080.
 
+## Client examples
+
+- [Python (redis-py)](examples/python/README.md) — SET/GET, hash, list, and VSET/VSEARCH
+
 ## How to use it
 
 ### Talk to it like Redis
