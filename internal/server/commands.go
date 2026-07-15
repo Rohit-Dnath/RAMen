@@ -29,18 +29,19 @@ func (s *Server) registerCommands() {
 		"BGSAVE":   (*conn).cmdSave,
 
 		// generic keyspace
-		"DEL":        (*conn).cmdDel,
-		"EXISTS":     (*conn).cmdExists,
-		"EXPIRE":     (*conn).cmdExpire,
-		"PEXPIRE":    (*conn).cmdPExpire,
-		"EXPIREAT":   (*conn).cmdExpireAt,
-		"PEXPIREAT":  (*conn).cmdPExpireAt,
-		"TTL":        (*conn).cmdTTL,
-		"PTTL":       (*conn).cmdPTTL,
-		"EXPIRETIME": (*conn).cmdExpireTime,
-		"PERSIST":    (*conn).cmdPersist,
-		"KEYS":       (*conn).cmdKeys,
-		"TYPE":       (*conn).cmdType,
+		"DEL":             (*conn).cmdDel,
+		"EXISTS":          (*conn).cmdExists,
+		"EXPIRE":          (*conn).cmdExpire,
+		"PEXPIRE":         (*conn).cmdPExpire,
+		"EXPIREAT":        (*conn).cmdExpireAt,
+		"PEXPIREAT":       (*conn).cmdPExpireAt,
+		"TTL":             (*conn).cmdTTL,
+		"PTTL":            (*conn).cmdPTTL,
+		"EXPIRETIME":      (*conn).cmdExpireTime,
+		"PERSIST":         (*conn).cmdPersist,
+		"KEYS":            (*conn).cmdKeys,
+		"TYPE":            (*conn).cmdType,
+		"OBJECT ENCODING": (*conn).cmdObjectEncoding,
 
 		// strings
 		"GET":         (*conn).cmdGet,
@@ -60,6 +61,7 @@ func (s *Server) registerCommands() {
 		"INCRBYFLOAT": (*conn).cmdIncrByFloat,
 		"MGET":        (*conn).cmdMGet,
 		"MSET":        (*conn).cmdMSet,
+		"COPY":        (*conn).cmdCopy,
 
 		// hashes
 		"HSET":         (*conn).cmdHSet,
@@ -87,6 +89,7 @@ func (s *Server) registerCommands() {
 		"LREM":    (*conn).cmdLRem,
 		"LTRIM":   (*conn).cmdLTrim,
 		"LINSERT": (*conn).cmdLInsert,
+		"SORT":    (*conn).cmdSort,
 
 		// sets
 		"SADD":      (*conn).cmdSAdd,

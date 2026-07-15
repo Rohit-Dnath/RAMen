@@ -91,21 +91,57 @@ func TestCoreCommands(t *testing.T) {
 	if r, _ := cli.Do("GET", "foo"); r != nil {
 		t.Fatalf("GET after DEL = %v", r)
 	}
+	mustDo(t, cli, "SET", "src", "value")
+	mustError(t, cli, "COPY", "src1", "dst")
+	if r := mustDo(t, cli, "COPY", "src", "dst"); r != "1" {
+		t.Fatalf("COPY = %v", r)
+	}
+	mustError(t, cli, "COPY", "src", "dst")
+	if r := mustDo(t, cli, "COPY", "src", "dst", "REPLACE"); r != "1" {
+		t.Fatalf("COPY with REPLACE = %v", r)
+	}
 }
 
 func TestDataStructures(t *testing.T) {
 	cli, cleanup := startTestServer(t)
 	defer cleanup()
 
-	mustDo(t, cli, "RPUSH", "l", "a", "b", "c")
-	if r := mustDo(t, cli, "LLEN", "l"); r != int64(3) {
+	mustDo(t, cli, "RPUSH", "nums", "1", "10", "2")
+	if r := mustDo(t, cli, "LLEN", "nums"); r != int64(3) {
 		t.Fatalf("LLEN = %v", r)
 	}
-	r := mustDo(t, cli, "LRANGE", "l", "0", "-1").([]any)
-	if len(r) != 3 || r[0] != "a" || r[2] != "c" {
+	r := mustDo(t, cli, "LRANGE", "nums", "0", "-1").([]any)
+	if len(r) != 3 || r[0] != "1" || r[1] != "10" || r[2] != "2" {
 		t.Fatalf("LRANGE = %v", r)
 	}
-
+	r = mustDo(t, cli, "SORT", "nums").([]any)
+	if len(r) != 3 || r[0] != "1" || r[1] != "2" || r[2] != "10" {
+		t.Fatalf("SORT = %v", r)
+	}
+	r = mustDo(t, cli, "SORT", "nums", "ALPHA").([]any)
+	if len(r) != 3 || r[0] != "1" || r[1] != "10" || r[2] != "2" {
+		t.Fatalf("SORT = %v", r)
+	}
+	r = mustDo(t, cli, "SORT", "nums", "LIMIT", "1", "2").([]any)
+	if len(r) != 2 || r[0] != "2" || r[1] != "10" {
+		t.Fatalf("SORT = %v", r)
+	}
+	r = mustDo(t, cli, "SORT", "nums", "LIMIT", "1", "100").([]any)
+	if len(r) != 2 || r[0] != "2" || r[1] != "10" {
+		t.Fatalf("SORT = %v", r)
+	}
+	r = mustDo(t, cli, "SORT", "nums", "DESC").([]any)
+	if len(r) != 3 || r[0] != "10" || r[1] != "2" || r[2] != "1" {
+		t.Fatalf("SORT = %v", r)
+	}
+	r = mustDo(t, cli, "SORT", "nums", "DESC", "LIMIT", "1", "2").([]any)
+	if len(r) != 2 || r[0] != "2" || r[1] != "1" {
+		t.Fatalf("SORT = %v", r)
+	}
+	r = mustDo(t, cli, "SORT", "nums", "LIMIT", "0", "2", "DESC").([]any)
+	if len(r) != 2 || r[0] != "10" || r[1] != "2" {
+		t.Fatalf("SORT = %v", r)
+	}
 	mustDo(t, cli, "HSET", "h", "f1", "v1", "f2", "v2")
 	if r := mustDo(t, cli, "HGET", "h", "f1"); r != "v1" {
 		t.Fatalf("HGET = %v", r)

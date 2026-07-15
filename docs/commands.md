@@ -35,6 +35,7 @@ conventions; arguments in `<>` are required, `[]` optional. RAMen is single
 | `PERSIST <key>` | Remove the TTL. |
 | `KEYS <pattern>` | Glob-match keys (`*`, `?`, `[...]`). |
 | `TYPE <key>` | `string`/`hash`/`list`/`set`/`zset`/`vector`/`none`. |
+| `OBJECT ENCODING <key>` | `string`/`hash`/`list`/`set`/`zset`/`vector`/`none`. |
 
 ## Strings
 
@@ -45,6 +46,7 @@ conventions; arguments in `<>` are required, `[]` optional. RAMen is single
 | `SETEX <key> <seconds> <value>` | Set with a TTL in seconds; rejects a non-positive TTL. |
 | `PSETEX <key> <ms> <value>` | Set with a TTL in milliseconds; rejects a non-positive TTL. |
 | `GET <key>` | Get a string. |
+| `COPY <source> <destination> [REPLACE]`| Copies from source to destination. `REPLACE` overwrites an existing destination. |
 | `GETSET <key> <value>` | Set and return the old value. |
 | `APPEND <key> <value>` | Append; returns new length. |
 | `STRLEN <key>` | Length of the string in bytes; `0` if missing. |
@@ -71,7 +73,7 @@ HGETALL user:1
 
 ## Lists
 
-`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LINDEX`, `LRANGE`, `LSET`, `LREM`, `LTRIM`, `LINSERT`.
+`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LINDEX`, `LRANGE`, `LSET`, `LREM`, `LTRIM`, `LINSERT`, `SORT`.
 
 ```
 RPUSH q a b c
@@ -81,6 +83,8 @@ LSET q 0 A             # overwrite index 0 (errors if the key or index is missin
 LREM q 1 A             # remove up to 1 "A" from the head; -1 would start at the tail, 0 removes all
 LTRIM q 0 1            # keep only indexes 0..1, drop the rest
 LINSERT q BEFORE b Z   # insert Z before the first "b"; returns new length, or -1 if b is missing
+SORT q
+SORT q DESC|ASC LIMIT 0 -1
 ```
 
 ## Sets

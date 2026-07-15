@@ -110,6 +110,14 @@ func (s *Server) dispatchCommand(c *conn, args []string) error {
 	s.stats.Commands.Add(1)
 	name := strings.ToUpper(args[0])
 
+	// multiple length commands
+	switch strings.ToUpper(name) {
+	case "OBJECT":
+		if len(args) > 1 {
+			name += " " + strings.ToUpper(args[1])
+		}
+	}
+
 	// When not authenticated, only AUTH (and QUIT) are permitted.
 	if s.cfg.Password != "" && !c.authed && name != "AUTH" && name != "QUIT" {
 		return c.writeError("NOAUTH Authentication required.")
