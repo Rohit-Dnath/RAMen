@@ -41,6 +41,7 @@ func (s *Server) registerCommands() {
 		"PERSIST":    (*conn).cmdPersist,
 		"KEYS":       (*conn).cmdKeys,
 		"TYPE":       (*conn).cmdType,
+		"SCAN":       (*conn).cmdScan,
 
 		// strings
 		"GET":         (*conn).cmdGet,
@@ -77,6 +78,7 @@ func (s *Server) registerCommands() {
 		"HLEN":         (*conn).cmdHLen,
 		"HEXISTS":      (*conn).cmdHExists,
 		"HMGET":        (*conn).cmdHMGet,
+		"HSCAN":        (*conn).cmdHScan,
 
 		// lists
 		"LPUSH":   (*conn).cmdLPush,
@@ -97,6 +99,7 @@ func (s *Server) registerCommands() {
 		"SMEMBERS":  (*conn).cmdSMembers,
 		"SISMEMBER": (*conn).cmdSIsMember,
 		"SCARD":     (*conn).cmdSCard,
+		"SSCAN":     (*conn).cmdSScan,
 
 		// sorted sets
 		"ZADD":          (*conn).cmdZAdd,
@@ -105,6 +108,7 @@ func (s *Server) registerCommands() {
 		"ZCARD":         (*conn).cmdZCard,
 		"ZRANGE":        (*conn).cmdZRange,
 		"ZRANGEBYSCORE": (*conn).cmdZRangeByScore,
+		"ZSCAN":         (*conn).cmdZScan,
 
 		// pub/sub
 		"SUBSCRIBE":   (*conn).cmdSubscribe,

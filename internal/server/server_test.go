@@ -847,3 +847,416 @@ func TestMSetNX(t *testing.T) {
 	mustError(t, cli, "MSETNX", "k", "v", "k2") // dangling key
 	mustError(t, cli, "MSETNX")                 // nothing
 }
+
+// scanReply asserts a single SCAN-family reply is a two-element array and
+// returns the next cursor plus the elements.
+func scanReply(t *testing.T, r any) (string, []string) {
+	t.Helper()
+	arr, ok := r.([]any)
+	if !ok || len(arr) != 2 {
+		t.Fatalf("scan reply is not a two-element array: %v", r)
+	}
+	cursor, ok := arr[0].(string)
+	if !ok {
+		t.Fatalf("scan cursor is not a bulk string: %v", arr[0])
+	}
+	rawElems, ok := arr[1].([]any)
+	if !ok {
+		t.Fatalf("scan elements is not an array: %v", arr[1])
+	}
+	elems := make([]string, len(rawElems))
+	for i, e := range rawElems {
+		s, ok := e.(string)
+		if !ok {
+			t.Fatalf("scan element %d is not a string: %v", i, e)
+		}
+		elems[i] = s
+	}
+	return cursor, elems
+}
+
+// scanCollect drives a SCAN-family command to completion and returns every
+// element gathered across the pages. prefix is the command plus any key that
+// comes before the cursor (e.g. {"SCAN"} or {"HSCAN", "h"}); match and count
+// are optional (empty/zero to omit). It fails if the cursor never returns to 0.
+func scanCollect(t *testing.T, cli *client.Client, prefix []string, match string, count int) []string {
+	t.Helper()
+	cursor := "0"
+	var out []string
+	for iter := 0; ; iter++ {
+		if iter > 200000 {
+			t.Fatalf("%v scan did not terminate (cursor stuck at %s)", prefix, cursor)
+		}
+		args := append([]string{}, prefix...)
+		args = append(args, cursor)
+		if match != "" {
+			args = append(args, "MATCH", match)
+		}
+		if count > 0 {
+			args = append(args, "COUNT", strconv.Itoa(count))
+		}
+		next, elems := scanReply(t, mustDo(t, cli, args...))
+		out = append(out, elems...)
+		if next == "0" {
+			return out
+		}
+		cursor = next
+	}
+}
+
+func TestScan(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// An empty keyspace terminates immediately at cursor 0 with no elements.
+	if cursor, elems := scanReply(t, mustDo(t, cli, "SCAN", "0")); cursor != "0" || len(elems) != 0 {
+		t.Fatalf("SCAN on empty db = (%q, %v)", cursor, elems)
+	}
+
+	// Insert enough keys to span many shards and force multiple pages.
+	const n = 1000
+	want := make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		k := "key:" + strconv.Itoa(i)
+		mustDo(t, cli, "SET", k, "v")
+		want[k] = true
+	}
+
+	// A full scan visits every key exactly once, regardless of COUNT.
+	for _, count := range []int{0, 1, 7, 100} {
+		got := scanCollect(t, cli, []string{"SCAN"}, "", count)
+		seen := make(map[string]bool, len(got))
+		for _, k := range got {
+			if seen[k] {
+				t.Fatalf("COUNT %d: key %q returned twice", count, k)
+			}
+			seen[k] = true
+		}
+		if len(seen) != n {
+			t.Fatalf("COUNT %d: scanned %d distinct keys, want %d", count, len(seen), n)
+		}
+		for k := range want {
+			if !seen[k] {
+				t.Fatalf("COUNT %d: key %q was missed", count, k)
+			}
+		}
+	}
+
+	// MATCH filters the results: "key:1?" matches key:10..key:19.
+	got := scanCollect(t, cli, []string{"SCAN"}, "key:1?", 0)
+	if len(got) != 10 {
+		t.Fatalf("SCAN MATCH key:1? returned %d keys, want 10: %v", len(got), got)
+	}
+	for _, k := range got {
+		if !want[k] {
+			t.Fatalf("SCAN MATCH returned an unexpected key %q", k)
+		}
+	}
+
+	// MATCH is applied after COUNT keys are fetched, so a page can be empty with
+	// a non-zero cursor. A client must loop until the cursor is 0, not stop at
+	// the first empty page. Assert an empty non-terminal page occurs and the full
+	// loop still matches nothing.
+	sawEmptyNonTerminal := false
+	cursor := "0"
+	for {
+		next, elems := scanReply(t, mustDo(t, cli, "SCAN", cursor, "MATCH", "nomatch:*", "COUNT", "10"))
+		if next != "0" && len(elems) == 0 {
+			sawEmptyNonTerminal = true
+		}
+		if len(elems) != 0 {
+			t.Fatalf("SCAN MATCH nomatch:* returned elements: %v", elems)
+		}
+		if next == "0" {
+			break
+		}
+		cursor = next
+	}
+	if !sawEmptyNonTerminal {
+		t.Fatal("expected at least one empty page with a non-zero cursor")
+	}
+
+	// Error handling: a bad cursor, a non-integer or non-positive COUNT, a
+	// dangling MATCH/COUNT, and an unknown option are all rejected.
+	mustError(t, cli, "SCAN", "notanumber")
+	mustError(t, cli, "SCAN", "0", "COUNT", "abc")
+	mustError(t, cli, "SCAN", "0", "COUNT", "0")
+	mustError(t, cli, "SCAN", "0", "COUNT", "-1")
+	mustError(t, cli, "SCAN", "0", "MATCH")
+	mustError(t, cli, "SCAN", "0", "COUNT")
+	mustError(t, cli, "SCAN", "0", "BOGUS", "x")
+	mustError(t, cli, "SCAN")
+
+	// A wildly out-of-range cursor must not panic; it yields a valid reply and
+	// the iteration still terminates cleanly at 0.
+	cursor = "999999999999999999"
+	for iter := 0; ; iter++ {
+		if iter > 1000 {
+			t.Fatal("huge-cursor scan did not terminate")
+		}
+		next, _ := scanReply(t, mustDo(t, cli, "SCAN", cursor))
+		if next == "0" {
+			break
+		}
+		cursor = next
+	}
+}
+
+// flatToMap turns a flat [k, v, k, v, ...] scan page into a map, failing on an
+// odd length or a repeated key (a field/member must not appear twice in a scan
+// with no concurrent mutation).
+func flatToMap(t *testing.T, flat []string) map[string]string {
+	t.Helper()
+	if len(flat)%2 != 0 {
+		t.Fatalf("flat list has odd length %d: %v", len(flat), flat)
+	}
+	m := make(map[string]string, len(flat)/2)
+	for i := 0; i < len(flat); i += 2 {
+		if _, dup := m[flat[i]]; dup {
+			t.Fatalf("key %q returned twice: %v", flat[i], flat)
+		}
+		m[flat[i]] = flat[i+1]
+	}
+	return m
+}
+
+func TestHScan(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// Missing key: cursor 0, no elements.
+	if cursor, elems := scanReply(t, mustDo(t, cli, "HSCAN", "nope", "0")); cursor != "0" || len(elems) != 0 {
+		t.Fatalf("HSCAN missing = (%q, %v)", cursor, elems)
+	}
+
+	const n = 500
+	want := make(map[string]string, n)
+	for i := 0; i < n; i++ {
+		f := "f:" + strconv.Itoa(i)
+		v := "v:" + strconv.Itoa(i)
+		mustDo(t, cli, "HSET", "h", f, v)
+		want[f] = v
+	}
+
+	// A full scan returns every field/value pair exactly once, for any COUNT.
+	for _, count := range []int{0, 1, 13, 1000} {
+		got := flatToMap(t, scanCollect(t, cli, []string{"HSCAN", "h"}, "", count))
+		if len(got) != n {
+			t.Fatalf("COUNT %d: got %d pairs, want %d", count, len(got), n)
+		}
+		for f, v := range want {
+			if got[f] != v {
+				t.Fatalf("COUNT %d: field %q = %q, want %q", count, f, got[f], v)
+			}
+		}
+	}
+
+	// MATCH filters on the field name: "f:1?" matches f:10..f:19.
+	got := flatToMap(t, scanCollect(t, cli, []string{"HSCAN", "h"}, "f:1?", 0))
+	if len(got) != 10 {
+		t.Fatalf("HSCAN MATCH f:1? returned %d pairs, want 10: %v", len(got), got)
+	}
+	for f, v := range got {
+		if want[f] != v {
+			t.Fatalf("HSCAN MATCH returned unexpected pair %q=%q", f, v)
+		}
+	}
+
+	// MATCH filters on the field name, not the value: a value-shaped pattern
+	// matches nothing even though values look like "v:NN".
+	if got := scanCollect(t, cli, []string{"HSCAN", "h"}, "v:1?", 0); len(got) != 0 {
+		t.Fatalf("HSCAN MATCH v:1? matched values, got %v", got)
+	}
+
+	// Wrong type and arity are rejected.
+	mustDo(t, cli, "SET", "str", "x")
+	mustError(t, cli, "HSCAN", "str", "0")
+	mustError(t, cli, "HSCAN", "h")
+	mustError(t, cli, "HSCAN", "h", "notanumber")
+	mustError(t, cli, "HSCAN", "h", "0", "COUNT", "0")
+}
+
+func TestSScan(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// Missing key: cursor 0, no elements.
+	if cursor, elems := scanReply(t, mustDo(t, cli, "SSCAN", "nope", "0")); cursor != "0" || len(elems) != 0 {
+		t.Fatalf("SSCAN missing = (%q, %v)", cursor, elems)
+	}
+
+	const n = 500
+	want := make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		m := "m:" + strconv.Itoa(i)
+		mustDo(t, cli, "SADD", "s", m)
+		want[m] = true
+	}
+
+	// A full scan returns every member exactly once, for any COUNT.
+	for _, count := range []int{0, 1, 13, 1000} {
+		got := scanCollect(t, cli, []string{"SSCAN", "s"}, "", count)
+		seen := make(map[string]bool, len(got))
+		for _, m := range got {
+			if seen[m] {
+				t.Fatalf("COUNT %d: member %q returned twice", count, m)
+			}
+			seen[m] = true
+		}
+		if len(seen) != n {
+			t.Fatalf("COUNT %d: got %d members, want %d", count, len(seen), n)
+		}
+		for m := range want {
+			if !seen[m] {
+				t.Fatalf("COUNT %d: member %q missed", count, m)
+			}
+		}
+	}
+
+	// MATCH filters on the member: "m:1?" matches m:10..m:19.
+	got := scanCollect(t, cli, []string{"SSCAN", "s"}, "m:1?", 0)
+	if len(got) != 10 {
+		t.Fatalf("SSCAN MATCH m:1? returned %d members, want 10: %v", len(got), got)
+	}
+
+	// Wrong type and arity are rejected.
+	mustDo(t, cli, "SET", "str", "x")
+	mustError(t, cli, "SSCAN", "str", "0")
+	mustError(t, cli, "SSCAN", "s")
+	mustError(t, cli, "SSCAN", "s", "notanumber")
+}
+
+func TestZScan(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// Missing key: cursor 0, no elements.
+	if cursor, elems := scanReply(t, mustDo(t, cli, "ZSCAN", "nope", "0")); cursor != "0" || len(elems) != 0 {
+		t.Fatalf("ZSCAN missing = (%q, %v)", cursor, elems)
+	}
+
+	const n = 400
+	want := make(map[string]string, n)
+	for i := 0; i < n; i++ {
+		m := "m:" + strconv.Itoa(i)
+		mustDo(t, cli, "ZADD", "z", strconv.Itoa(i), m)
+		want[m] = strconv.Itoa(i) // formatFloat of an integer-valued score
+	}
+
+	// A full scan returns every member/score pair exactly once, for any COUNT.
+	for _, count := range []int{0, 1, 13, 1000} {
+		got := flatToMap(t, scanCollect(t, cli, []string{"ZSCAN", "z"}, "", count))
+		if len(got) != n {
+			t.Fatalf("COUNT %d: got %d pairs, want %d", count, len(got), n)
+		}
+		for m, sc := range want {
+			if got[m] != sc {
+				t.Fatalf("COUNT %d: member %q score = %q, want %q", count, m, got[m], sc)
+			}
+		}
+	}
+
+	// MATCH filters on the member name: "m:1?" matches m:10..m:19.
+	got := flatToMap(t, scanCollect(t, cli, []string{"ZSCAN", "z"}, "m:1?", 0))
+	if len(got) != 10 {
+		t.Fatalf("ZSCAN MATCH m:1? returned %d pairs, want 10: %v", len(got), got)
+	}
+	for m, sc := range got {
+		if want[m] != sc {
+			t.Fatalf("ZSCAN MATCH returned unexpected pair %q=%q", m, sc)
+		}
+	}
+
+	// MATCH filters on the member, not the score: a score-shaped pattern
+	// matches nothing.
+	if got := scanCollect(t, cli, []string{"ZSCAN", "z"}, "1?", 0); len(got) != 0 {
+		t.Fatalf("ZSCAN MATCH 1? matched scores, got %v", got)
+	}
+
+	// Scores are formatted like ZSCORE, including fractional values.
+	mustDo(t, cli, "ZADD", "z2", "3.5", "half")
+	_, elems := scanReply(t, mustDo(t, cli, "ZSCAN", "z2", "0"))
+	if len(elems) != 2 || elems[0] != "half" || elems[1] != "3.5" {
+		t.Fatalf("ZSCAN score formatting = %v", elems)
+	}
+
+	// Wrong type and arity are rejected.
+	mustDo(t, cli, "SET", "str", "x")
+	mustError(t, cli, "ZSCAN", "str", "0")
+	mustError(t, cli, "ZSCAN", "z")
+	mustError(t, cli, "ZSCAN", "z", "notanumber")
+}
+
+// TestScanCrashResistance covers hostile inputs that must not panic the server:
+// a COUNT large enough to overflow the slice index, and a cursor past the end of
+// the collection. Both must return a valid reply and keep the server serving.
+func TestScanCrashResistance(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	mustDo(t, cli, "HSET", "h", "a", "1", "b", "2")
+	mustDo(t, cli, "SADD", "s", "x", "y")
+	mustDo(t, cli, "ZADD", "z", "1", "p", "2", "q")
+
+	const huge = "9223372036854775807" // math.MaxInt64
+	const past = "999999999999999999"
+
+	// A huge COUNT starting mid-collection must return the tail and cursor 0,
+	// not overflow the slice bound and crash.
+	if cur, elems := scanReply(t, mustDo(t, cli, "HSCAN", "h", "1", "COUNT", huge)); cur != "0" || len(elems) != 2 {
+		t.Fatalf("HSCAN huge COUNT = (%q, %v)", cur, elems)
+	}
+	if cur, elems := scanReply(t, mustDo(t, cli, "SSCAN", "s", "1", "COUNT", huge)); cur != "0" || len(elems) != 1 {
+		t.Fatalf("SSCAN huge COUNT = (%q, %v)", cur, elems)
+	}
+	if cur, elems := scanReply(t, mustDo(t, cli, "ZSCAN", "z", "1", "COUNT", huge)); cur != "0" || len(elems) != 2 {
+		t.Fatalf("ZSCAN huge COUNT = (%q, %v)", cur, elems)
+	}
+
+	// An out-of-range cursor must terminate cleanly at 0 with no elements.
+	for _, cmd := range [][]string{{"HSCAN", "h"}, {"SSCAN", "s"}, {"ZSCAN", "z"}} {
+		args := append(append([]string{}, cmd...), past)
+		if cur, elems := scanReply(t, mustDo(t, cli, args...)); cur != "0" || len(elems) != 0 {
+			t.Fatalf("%v out-of-range cursor = (%q, %v)", cmd, cur, elems)
+		}
+	}
+
+	// The server is still responsive after all of the above.
+	if r := mustDo(t, cli, "PING"); r != "PONG" {
+		t.Fatalf("server unresponsive after hostile scans: %v", r)
+	}
+}
+
+// TestScanSkipsExpired verifies a scan never returns a key whose TTL has passed,
+// and that a typed scan of an expired collection is treated as a missing key.
+func TestScanSkipsExpired(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	mustDo(t, cli, "SET", "keep", "v")
+	mustDo(t, cli, "SET", "gone", "v", "PX", "20")
+	mustDo(t, cli, "HSET", "h", "f", "v")
+	mustDo(t, cli, "PEXPIRE", "h", "20")
+	time.Sleep(60 * time.Millisecond)
+
+	keys := scanCollect(t, cli, []string{"SCAN"}, "", 0)
+	for _, k := range keys {
+		if k == "gone" {
+			t.Fatalf("SCAN returned the expired key %q", k)
+		}
+	}
+	found := false
+	for _, k := range keys {
+		if k == "keep" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("SCAN dropped the live key: %v", keys)
+	}
+
+	// The expired hash scans like a missing key.
+	if cur, elems := scanReply(t, mustDo(t, cli, "HSCAN", "h", "0")); cur != "0" || len(elems) != 0 {
+		t.Fatalf("HSCAN of expired hash = (%q, %v)", cur, elems)
+	}
+}
