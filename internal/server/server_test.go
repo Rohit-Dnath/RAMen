@@ -866,6 +866,14 @@ func TestZIncrBy(t *testing.T) {
 		t.Fatalf("ZSCORE after ZINCRBY = %v", r)
 	}
 
+	// a whole-number score replies as plain digits, not Go's "1e+06" (#64)
+	if r := mustDo(t, cli, "ZINCRBY", "lb", "1000000", "m"); r != "1000000" {
+		t.Fatalf("ZINCRBY 1000000 = %v, want 1000000", r)
+	}
+	if r := mustDo(t, cli, "ZRANGE", "lb", "0", "-1", "WITHSCORES").([]any); len(r) != 2 || r[1] != "1000000" {
+		t.Fatalf("ZRANGE WITHSCORES = %v, want [m 1000000]", r)
+	}
+
 	// an infinite score renders as Redis's "inf"/"-inf", not Go's "+Inf"
 	if r := mustDo(t, cli, "ZINCRBY", "z", "inf", "big"); r != "inf" {
 		t.Fatalf("ZINCRBY inf = %v, want inf", r)
