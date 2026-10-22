@@ -41,6 +41,9 @@ func (s *Server) registerCommands() {
 		"PERSIST":    (*conn).cmdPersist,
 		"KEYS":       (*conn).cmdKeys,
 		"TYPE":       (*conn).cmdType,
+		"RENAME":     (*conn).cmdRename,
+		"RENAMENX":   (*conn).cmdRenameNX,
+		"RANDOMKEY":  (*conn).cmdRandomKey,
 
 		// strings
 		"GET":         (*conn).cmdGet,
@@ -355,6 +358,37 @@ func (c *conn) cmdType(args []string) error {
 		return c.wrongArgs("type")
 	}
 	return c.writeSimple(c.s.store.Type(args[1]))
+}
+
+func (c *conn) cmdRename(args []string) error {
+	if len(args) != 3 {
+		return c.wrongArgs("rename")
+	}
+	if err := c.s.store.Rename(args[1], args[2]); err != nil {
+		return c.storeErr(err)
+	}
+	return c.writeSimple("OK")
+}
+
+func (c *conn) cmdRenameNX(args []string) error {
+	if len(args) != 3 {
+		return c.wrongArgs("renamenx")
+	}
+	renamed, err := c.s.store.RenameNX(args[1], args[2])
+	if err != nil {
+		return c.storeErr(err)
+	}
+	return c.writeInt(boolToInt(renamed))
+}
+
+func (c *conn) cmdRandomKey(args []string) error {
+	if len(args) != 1 {
+		return c.wrongArgs("randomkey")
+	}
+	if k, ok := c.s.store.RandomKey(); ok {
+		return c.writeBulk(k)
+	}
+	return c.writeNull()
 }
 
 func boolToInt(b bool) int64 {

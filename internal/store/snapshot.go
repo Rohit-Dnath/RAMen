@@ -30,12 +30,29 @@ type VecRecord struct {
 }
 
 // Export returns a snapshot of every live key. It is safe to call while the
-// store is serving traffic; each shard is read-locked in turn.
+// store is serving traffic. Every shard is read-locked for the whole scan so
+// the snapshot is a globally consistent view: RENAME moves a key from one shard
+// to another, so releasing each shard before reading the next could otherwise
+// record the key twice or miss it entirely. Locks are taken in shard-index
+// order, matching every other multi-shard operation, so this cannot deadlock.
+//
+// Values that writers mutate in place (hash maps, list slices) are copied while
+// the locks are held, so the returned records share no memory with live data
+// and can be serialised after Export returns without racing concurrent writes.
+// The other types are already detached: sets and zsets are built fresh here,
+// and vector items are replaced wholesale on write, never mutated in place.
 func (s *Store) Export() []Record {
 	now := s.now()
-	var out []Record
 	for _, sh := range s.shards {
 		sh.mu.RLock()
+	}
+	defer func() {
+		for _, sh := range s.shards {
+			sh.mu.RUnlock()
+		}
+	}()
+	var out []Record
+	for _, sh := range s.shards {
 		for k, e := range sh.m {
 			if e.expired(now) {
 				continue
@@ -48,9 +65,15 @@ func (s *Store) Export() []Record {
 			case string:
 				rec.Type, rec.Str = "string", v
 			case map[string]string:
-				rec.Type, rec.Hash = "hash", v
+				rec.Type = "hash"
+				h := make(map[string]string, len(v))
+				for f, fv := range v {
+					h[f] = fv
+				}
+				rec.Hash = h
 			case *list:
-				rec.Type, rec.List = "list", v.items
+				rec.Type = "list"
+				rec.List = append([]string(nil), v.items...)
 			case map[string]struct{}:
 				rec.Type = "set"
 				for m := range v {
@@ -68,7 +91,6 @@ func (s *Store) Export() []Record {
 			}
 			out = append(out, rec)
 		}
-		sh.mu.RUnlock()
 	}
 	return out
 }

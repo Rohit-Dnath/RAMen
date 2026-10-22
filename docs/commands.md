@@ -35,6 +35,9 @@ conventions; arguments in `<>` are required, `[]` optional. RAMen is single
 | `PERSIST <key>` | Remove the TTL. |
 | `KEYS <pattern>` | Glob-match keys (`*`, `?`, `[...]`). |
 | `TYPE <key>` | `string`/`hash`/`list`/`set`/`zset`/`vector`/`none`. |
+| `RENAME <key> <newkey>` | Rename a key, overwriting `newkey`; the TTL moves with it. Errors if the key is missing. |
+| `RENAMENX <key> <newkey>` | Rename only if `newkey` does not exist; `1` if renamed, `0` if it already exists. |
+| `RANDOMKEY` | Return a random key, or nil when the keyspace is empty. |
 
 ## Strings
 

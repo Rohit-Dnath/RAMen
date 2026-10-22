@@ -1055,3 +1055,233 @@ func TestSetPopRandom(t *testing.T) {
 		t.Fatalf("SRandMember wrong type = %v", err)
 	}
 }
+
+func TestRename(t *testing.T) {
+	s := New()
+
+	if err := s.Rename("nope", "dst"); err != ErrNoSuchKey {
+		t.Fatalf("Rename missing src = %v, want ErrNoSuchKey", err)
+	}
+
+	// a missing source errors even when src == dst: the miss must win over the
+	// self-rename short-circuit
+	if err := s.Rename("ghost", "ghost"); err != ErrNoSuchKey {
+		t.Fatalf("Rename missing self = %v, want ErrNoSuchKey", err)
+	}
+
+	// basic move: value follows, source disappears
+	s.Set("a", "1", SetOptions{})
+	if err := s.Rename("a", "b"); err != nil {
+		t.Fatalf("Rename = %v", err)
+	}
+	if v, ok, _ := s.Get("b"); !ok || v != "1" {
+		t.Fatalf("after Rename b = %q ok=%v", v, ok)
+	}
+	if s.Exists("a") != 0 {
+		t.Fatal("source should be gone after Rename")
+	}
+
+	// the TTL travels with the key
+	s.Set("t", "v", SetOptions{})
+	s.Expire("t", 100*time.Second)
+	if err := s.Rename("t", "t2"); err != nil {
+		t.Fatalf("Rename with TTL = %v", err)
+	}
+	if d, hasTTL, ok := s.TTL("t2"); !ok || !hasTTL || d <= 0 {
+		t.Fatalf("TTL did not travel: d=%v hasTTL=%v ok=%v", d, hasTTL, ok)
+	}
+
+	// renaming over an existing key replaces it wholesale: the destination's own
+	// TTL is dropped along with its old value
+	s.Set("src", "new", SetOptions{})
+	s.Set("dst", "old", SetOptions{})
+	s.Expire("dst", 100*time.Second)
+	if err := s.Rename("src", "dst"); err != nil {
+		t.Fatalf("Rename overwrite = %v", err)
+	}
+	if v, ok, _ := s.Get("dst"); !ok || v != "new" {
+		t.Fatalf("overwrite dst = %q ok=%v", v, ok)
+	}
+	if _, hasTTL, _ := s.TTL("dst"); hasTTL {
+		t.Fatal("dst kept its old TTL; the source (no TTL) should have replaced it")
+	}
+
+	// rename works regardless of value type and discards the destination's type
+	s.push("lst", true, []string{"x"})
+	s.Set("strkey", "s", SetOptions{})
+	if err := s.Rename("lst", "strkey"); err != nil {
+		t.Fatalf("Rename list over string = %v", err)
+	}
+	if s.Type("strkey") != "list" {
+		t.Fatalf("dst type after rename = %q, want list", s.Type("strkey"))
+	}
+
+	// rename to itself is a successful no-op
+	s.Set("self", "v", SetOptions{})
+	if err := s.Rename("self", "self"); err != nil {
+		t.Fatalf("Rename self = %v", err)
+	}
+	if v, ok, _ := s.Get("self"); !ok || v != "v" {
+		t.Fatalf("self after no-op rename = %q ok=%v", v, ok)
+	}
+
+	// pathological key names: empty source key and a 1 MiB destination key
+	long := strings.Repeat("k", 1<<20)
+	s.Set("", "empty-key", SetOptions{})
+	if err := s.Rename("", long); err != nil {
+		t.Fatalf("Rename empty->long = %v", err)
+	}
+	if v, ok, _ := s.Get(long); !ok || v != "empty-key" {
+		t.Fatalf("long key value = %q ok=%v", v, ok)
+	}
+}
+
+func TestRenameNX(t *testing.T) {
+	s := New()
+	cur := time.Unix(1000, 0)
+	s.now = func() time.Time { return cur }
+
+	if _, err := s.RenameNX("nope", "dst"); err != ErrNoSuchKey {
+		t.Fatalf("RenameNX missing src = %v, want ErrNoSuchKey", err)
+	}
+
+	// a missing source errors even when src == dst
+	if _, err := s.RenameNX("ghost", "ghost"); err != ErrNoSuchKey {
+		t.Fatalf("RenameNX missing self = %v, want ErrNoSuchKey", err)
+	}
+
+	// destination free: renames, reports true, TTL travels
+	s.Set("a", "1", SetOptions{})
+	s.Expire("a", 100*time.Second)
+	if ok, err := s.RenameNX("a", "b"); err != nil || !ok {
+		t.Fatalf("RenameNX to free dst = %v, %v; want true, nil", ok, err)
+	}
+	if v, got, _ := s.Get("b"); !got || v != "1" {
+		t.Fatalf("RenameNX moved value = %q got=%v", v, got)
+	}
+	if _, hasTTL, _ := s.TTL("b"); !hasTTL {
+		t.Fatal("RenameNX did not carry the TTL over")
+	}
+
+	// destination exists: no move, reports false, both keys untouched
+	s.Set("x", "xv", SetOptions{})
+	s.Set("y", "yv", SetOptions{})
+	if ok, err := s.RenameNX("x", "y"); err != nil || ok {
+		t.Fatalf("RenameNX to existing dst = %v, %v; want false, nil", ok, err)
+	}
+	if v, _, _ := s.Get("x"); v != "xv" {
+		t.Fatal("RenameNX with existing dst should leave src in place")
+	}
+	if v, _, _ := s.Get("y"); v != "yv" {
+		t.Fatal("RenameNX with existing dst should leave dst unchanged")
+	}
+
+	// rename to itself: the destination "exists", so it reports false
+	s.Set("self", "v", SetOptions{})
+	if ok, err := s.RenameNX("self", "self"); err != nil || ok {
+		t.Fatalf("RenameNX self = %v, %v; want false, nil", ok, err)
+	}
+	if v, got, _ := s.Get("self"); !got || v != "v" {
+		t.Fatalf("self key damaged by RenameNX no-op = %q got=%v", v, got)
+	}
+
+	// an expired destination does not count as existing
+	s.Set("src2", "sv", SetOptions{})
+	s.Set("dead", "dv", SetOptions{})
+	s.Expire("dead", time.Second)
+	cur = cur.Add(2 * time.Second)
+	if ok, err := s.RenameNX("src2", "dead"); err != nil || !ok {
+		t.Fatalf("RenameNX over expired dst = %v, %v; want true, nil", ok, err)
+	}
+	if v, got, _ := s.Get("dead"); !got || v != "sv" {
+		t.Fatalf("RenameNX over expired dst value = %q got=%v", v, got)
+	}
+}
+
+func TestRenameConcurrent(t *testing.T) {
+	s := New()
+	// Two keys guaranteed to live on different shards, so every rename locks a
+	// pair of shards. Goroutines rename in both directions at once: a wrong lock
+	// order would deadlock this test, and -race would flag any unsafe access to
+	// the shard maps.
+	a, b := "ra", "rb"
+	for i := 0; s.shardIndex(a) == s.shardIndex(b); i++ {
+		b = "rb" + strconv.Itoa(i)
+	}
+	s.Set(a, "v", SetOptions{})
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 2000; i++ {
+				s.Rename(a, b) // a -> b (may be a no-op if already moved)
+				s.Rename(b, a) // b -> a
+				s.Exists(a)    // concurrent readers taking read locks
+				s.Exists(b)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// the single key is never duplicated or lost: exactly one survives
+	if n := s.Exists(a) + s.Exists(b); n != 1 {
+		t.Fatalf("after concurrent renames, live keys among {a,b} = %d, want 1", n)
+	}
+}
+
+func TestRandomKey(t *testing.T) {
+	s := New()
+	cur := time.Unix(1000, 0)
+	s.now = func() time.Time { return cur }
+
+	// empty keyspace
+	if _, ok := s.RandomKey(); ok {
+		t.Fatal("RandomKey on an empty keyspace should be ok=false")
+	}
+
+	// a single key is always the one returned
+	s.Set("only", "v", SetOptions{})
+	if k, ok := s.RandomKey(); !ok || k != "only" {
+		t.Fatalf("RandomKey single = %q ok=%v", k, ok)
+	}
+
+	// across a large keyspace every result is a live member of the set; the
+	// distribution is intentionally not asserted (RANDOMKEY is best-effort)
+	want := map[string]bool{"only": true}
+	for i := 0; i < 1000; i++ {
+		k := "k" + strconv.Itoa(i)
+		s.Set(k, "v", SetOptions{})
+		want[k] = true
+	}
+	for i := 0; i < 200; i++ {
+		k, ok := s.RandomKey()
+		if !ok || !want[k] {
+			t.Fatalf("RandomKey returned %q ok=%v, not a live key", k, ok)
+		}
+	}
+
+	// expired keys are never returned
+	s.Flush()
+	s.Set("live", "v", SetOptions{})
+	s.Set("dead", "v", SetOptions{})
+	s.Expire("dead", time.Second)
+	cur = cur.Add(2 * time.Second)
+	for i := 0; i < 100; i++ {
+		if k, ok := s.RandomKey(); !ok || k != "live" {
+			t.Fatalf("RandomKey should only return the live key, got %q ok=%v", k, ok)
+		}
+	}
+
+	// a keyspace whose keys have all expired reports empty again
+	s.Flush()
+	s.Set("g1", "v", SetOptions{})
+	s.Set("g2", "v", SetOptions{})
+	s.Expire("g1", time.Second)
+	s.Expire("g2", time.Second)
+	cur = cur.Add(2 * time.Second)
+	if _, ok := s.RandomKey(); ok {
+		t.Fatal("RandomKey with only expired keys should be ok=false")
+	}
+}

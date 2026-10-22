@@ -7,6 +7,7 @@ package store
 
 import (
 	"hash/fnv"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -55,9 +56,15 @@ func New() *Store {
 }
 
 func (s *Store) shardFor(key string) *shard {
+	return s.shards[s.shardIndex(key)]
+}
+
+// shardIndex returns the index of the shard that owns key. Rename needs the
+// index, not just the shard, so it can lock two shards in a fixed order.
+func (s *Store) shardIndex(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
-	return s.shards[h.Sum32()%shardCount]
+	return int(h.Sum32() % shardCount)
 }
 
 // getLive returns the live entry for key, deleting it first if it has expired
@@ -145,6 +152,65 @@ func (s *Store) Type(key string) string {
 	default:
 		return "none"
 	}
+}
+
+// Rename moves src to newkey, overwriting newkey if it already exists. The whole
+// entry is moved, so any TTL travels with the key. It returns ErrNoSuchKey when
+// src does not exist, matching Redis.
+func (s *Store) Rename(src, newkey string) error {
+	_, err := s.rename(src, newkey, false)
+	return err
+}
+
+// RenameNX renames src to newkey only when newkey does not already exist. It
+// reports whether the rename happened (false when newkey exists) and returns
+// ErrNoSuchKey when src does not exist.
+func (s *Store) RenameNX(src, newkey string) (bool, error) {
+	return s.rename(src, newkey, true)
+}
+
+// rename is the shared implementation of RENAME/RENAMENX. It locks the source
+// and destination shards in a fixed (lowest-index-first) order so two renames
+// running between the same pair of shards cannot deadlock, and locks only once
+// when both keys live on the same shard.
+func (s *Store) rename(src, newkey string, nx bool) (bool, error) {
+	si, di := s.shardIndex(src), s.shardIndex(newkey)
+	ss, ds := s.shards[si], s.shards[di]
+
+	switch {
+	case si == di:
+		ss.mu.Lock()
+		defer ss.mu.Unlock()
+	case si < di:
+		ss.mu.Lock()
+		defer ss.mu.Unlock()
+		ds.mu.Lock()
+		defer ds.mu.Unlock()
+	default:
+		ds.mu.Lock()
+		defer ds.mu.Unlock()
+		ss.mu.Lock()
+		defer ss.mu.Unlock()
+	}
+
+	now := s.now()
+	e, ok := ss.getLive(src, now)
+	if !ok {
+		return false, ErrNoSuchKey
+	}
+	// Renaming a key to itself is a no-op that still succeeds; RENAMENX treats
+	// the destination as already present and reports that nothing moved.
+	if src == newkey {
+		return !nx, nil
+	}
+	if nx {
+		if _, exists := ds.peekLive(newkey, now); exists {
+			return false, nil
+		}
+	}
+	ds.m[newkey] = e
+	delete(ss.m, src)
+	return true, nil
 }
 
 // Expire sets a relative TTL in milliseconds on an existing key. It reports
@@ -258,6 +324,29 @@ func (s *Store) DBSize() int {
 		sh.mu.RUnlock()
 	}
 	return n
+}
+
+// RandomKey returns a randomly chosen live key, or ok=false when the keyspace
+// is empty. It starts at a random shard and scans forward, returning a key from
+// the first shard that holds one; Go's randomised map iteration makes the pick
+// within that shard random too. Expired keys are skipped but left in place for
+// the sweeper, so only a read lock is taken (never getLive, which deletes and
+// would race concurrent readers).
+func (s *Store) RandomKey() (string, bool) {
+	now := s.now()
+	start := rand.Intn(shardCount)
+	for i := 0; i < shardCount; i++ {
+		sh := s.shards[(start+i)%shardCount]
+		sh.mu.RLock()
+		for k, e := range sh.m {
+			if !e.expired(now) {
+				sh.mu.RUnlock()
+				return k, true
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return "", false
 }
 
 // Flush removes every key.
