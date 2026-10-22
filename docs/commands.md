@@ -108,7 +108,7 @@ LINSERT q BEFORE b Z   # insert Z before the first "b"; returns new length, or -
 
 | Command | Description |
 |---|---|
-| `ZADD <key> <score> <member> [score member ...]` | Add or update members; returns the number newly added. |
+| `ZADD <key> <score> <member> [score member ...]` | Add or update members; returns the number newly added. Scores may be `inf`/`-inf`; a `nan` score is an error and nothing is written. |
 | `ZREM <key> <member ...>` | Remove members; returns the number removed. |
 | `ZSCORE <key> <member>` | The member's score, or nil. |
 | `ZINCRBY <key> <increment> <member>` | Add `increment` to the member's score (creating it); returns the new score. |

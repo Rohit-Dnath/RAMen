@@ -15,8 +15,9 @@ func (c *conn) cmdZAdd(args []string) error {
 	}
 	members := make([]store.ZMember, 0, (len(args)-2)/2)
 	for i := 2; i+1 < len(args); i += 2 {
+		// ParseFloat accepts "nan"; a NaN score would break the set's ordering
 		score, err := strconv.ParseFloat(args[i], 64)
-		if err != nil {
+		if err != nil || math.IsNaN(score) {
 			return c.writeError("ERR value is not a valid float")
 		}
 		members = append(members, store.ZMember{Member: args[i+1], Score: score})
