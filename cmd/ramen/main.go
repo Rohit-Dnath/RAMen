@@ -49,6 +49,7 @@ func runServer(argv []string) error {
 	snapPath := fs.String("snapshot-path", env("RAMEN_SNAPSHOT_PATH", "ramen.snapshot"), "snapshot file path ('' disables persistence)")
 	snapInterval := fs.Duration("snapshot-interval", envDuration("RAMEN_SNAPSHOT_INTERVAL", 60*time.Second), "how often to snapshot to disk")
 	sweepInterval := fs.Duration("sweep-interval", envDuration("RAMEN_SWEEP_INTERVAL", 10*time.Second), "how often the expiry sweeper runs")
+	scacheMax := fs.Int("scache-max", envInt("RAMEN_SCACHE_MAX", 10000), "max semantic cache entries before LRU eviction (0 = unbounded)")
 	dashAddr := fs.String("dashboard-addr", env("RAMEN_DASHBOARD_ADDR", ":8080"), "web dashboard address ('' disables it)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	fs.Parse(argv)
@@ -91,6 +92,7 @@ func runServer(argv []string) error {
 		Password:    *password,
 		Snapshotter: snap,
 		Embed:       emb,
+		SCacheMax:   *scacheMax,
 	})
 
 	// Background snapshotting until shutdown, then a final save.
@@ -157,6 +159,17 @@ func envDuration(key string, def time.Duration) time.Duration {
 	// Allow a bare integer to mean seconds.
 	if n, err := strconv.Atoi(v); err == nil {
 		return time.Duration(n) * time.Second
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
 	}
 	return def
 }

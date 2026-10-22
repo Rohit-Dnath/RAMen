@@ -1376,3 +1376,38 @@ func TestVectorExpirySnapshot(t *testing.T) {
 		t.Fatal("an all-expired collection loaded as an empty key")
 	}
 }
+
+func TestVectorEnforceCap(t *testing.T) {
+	s := New()
+	cur := time.Unix(1000, 0)
+	s.now = func() time.Time { return cur }
+
+	s.VSet("c", "dead", []float32{1, 0}, "", 1005)
+	cur = time.Unix(1010, 0)
+	s.VSet("c", "old", []float32{0, 1}, "", 0)
+	cur = time.Unix(1020, 0)
+	s.VSet("c", "new", []float32{1, 1}, "", 0)
+
+	// Over the cap, the expired item is reclaimed first; no live item is
+	// evicted when that already brings the collection under the bound.
+	s.VEnforceCap("c", 2)
+	if n, _ := s.VCard("c"); n != 2 {
+		t.Fatalf("VCard after cap = %d, want 2 (expired swept first)", n)
+	}
+	if res, _ := s.VSearch("c", []float32{0, 1}, 10); len(res) != 2 {
+		t.Fatalf("live items after cap = %v, want old and new", res)
+	}
+
+	// A tighter cap evicts the least recently inserted live item.
+	s.VEnforceCap("c", 1)
+	res, _ := s.VSearch("c", []float32{1, 1}, 10)
+	if len(res) != 1 || res[0].Item.ID != "new" {
+		t.Fatalf("after LRU eviction = %v, want new only", res)
+	}
+
+	// 0 explicitly disables the bound.
+	s.VEnforceCap("c", 0)
+	if n, _ := s.VCard("c"); n != 1 {
+		t.Fatalf("unbounded cap changed the collection: VCard = %d", n)
+	}
+}

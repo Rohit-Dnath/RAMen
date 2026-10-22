@@ -25,6 +25,9 @@ type Config struct {
 	Password    string // optional AUTH password ("" disables auth)
 	Snapshotter *persist.Snapshotter
 	Embed       *embed.Client
+	// SCacheMax bounds the semantic cache to this many entries, evicting the
+	// least-recently-used past it. 0 means unbounded.
+	SCacheMax int
 }
 
 // Server holds shared state for all connections.

@@ -228,3 +228,33 @@ func TestSweepExpired(t *testing.T) {
 		t.Fatal("SweepExpired removed the item with no expiry")
 	}
 }
+
+func TestEvictLRU(t *testing.T) {
+	c := NewCollection()
+	c.Set("a", []float32{1, 0}, "", 0)
+	c.Set("b", []float32{0, 1}, "", 0)
+	c.Set("d", []float32{1, 1}, "", 0)
+	c.Touch("a", 30)
+	c.Touch("b", 10)
+	c.Touch("d", 20)
+
+	// max <= 0 means unbounded: nothing is evicted.
+	if n := c.EvictLRU(0); n != 0 || c.Len() != 3 {
+		t.Fatalf("EvictLRU(0) evicted %d, len %d; want none", n, c.Len())
+	}
+	// Three items fit inside one sample, so eviction is exact LRU here.
+	if n := c.EvictLRU(2); n != 1 || c.Len() != 2 {
+		t.Fatalf("EvictLRU(2) evicted %d, len %d; want 1 and 2", n, c.Len())
+	}
+	if _, ok := c.items["b"]; ok {
+		t.Fatal("EvictLRU kept the least-recently-used item")
+	}
+	// A touch refreshes an item's position.
+	c.Touch("a", 40)
+	if n := c.EvictLRU(1); n != 1 || c.Len() != 1 {
+		t.Fatalf("EvictLRU(1) evicted %d, len %d; want 1 and 1", n, c.Len())
+	}
+	if _, ok := c.items["a"]; !ok {
+		t.Fatal("EvictLRU evicted the most-recently-touched item")
+	}
+}

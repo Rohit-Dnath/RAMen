@@ -22,6 +22,11 @@ type Item struct {
 	Meta       string
 	ExpireUnix int64   // Unix seconds the item expires at; 0 == no expiry
 	norm       float64 // Euclidean norm of Vec, cached at insert time; not persisted
+	// lastAccess orders items for LRU eviction; the store stamps it with
+	// UnixNano so back-to-back accesses in the same second keep their order.
+	// Not persisted: items loaded from a snapshot start at 0 and rank oldest
+	// until they are used again.
+	lastAccess int64
 }
 
 // expired reports whether the item's deadline has passed at nowUnix. A zero
@@ -57,6 +62,15 @@ func (c *Collection) Set(id string, vec []float32, meta string, expireUnix int64
 	return nil
 }
 
+// Touch records that the item was just used, so LRU eviction keeps it longer.
+// now is any monotonically increasing ordering value; the store passes
+// UnixNano.
+func (c *Collection) Touch(id string, now int64) {
+	if it, ok := c.items[id]; ok {
+		it.lastAccess = now
+	}
+}
+
 // SweepExpired removes every item whose deadline is past at nowUnix and
 // returns how many were removed. Items with no expiry are untouched.
 func (c *Collection) SweepExpired(nowUnix int64) int {
@@ -78,6 +92,37 @@ func norm(v []float32) float64 {
 		sum += f * f
 	}
 	return math.Sqrt(sum)
+}
+
+// evictSample is how many candidates an eviction round examines. Like Redis's
+// approximated LRU, evicting the oldest of a small random sample gets close to
+// true LRU without keeping the items in an ordered structure.
+const evictSample = 5
+
+// EvictLRU removes items until the collection holds at most max, picking each
+// victim as the least-recently-used of a sample (map iteration order supplies
+// the randomness). It returns how many were evicted. max <= 0 evicts nothing.
+func (c *Collection) EvictLRU(max int) int {
+	if max <= 0 {
+		return 0
+	}
+	evicted := 0
+	for len(c.items) > max {
+		var victim *Item
+		seen := 0
+		for _, it := range c.items {
+			if victim == nil || it.lastAccess < victim.lastAccess {
+				victim = it
+			}
+			seen++
+			if seen >= evictSample {
+				break
+			}
+		}
+		delete(c.items, victim.ID)
+		evicted++
+	}
+	return evicted
 }
 
 // Del removes id; it reports whether the id existed.

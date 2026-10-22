@@ -1283,6 +1283,12 @@ func TestRandomKey(t *testing.T) {
 // exact. It returns a connected client, the underlying store, and a cleanup.
 func startSCacheServer(t *testing.T, prompts map[string][]float32) (*client.Client, *store.Store, func()) {
 	t.Helper()
+	return startSCacheServerMax(t, prompts, 0)
+}
+
+// startSCacheServerMax is startSCacheServer with a semantic cache entry cap.
+func startSCacheServerMax(t *testing.T, prompts map[string][]float32, max int) (*client.Client, *store.Store, func()) {
+	t.Helper()
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Input string `json:"input"`
@@ -1305,7 +1311,7 @@ func startSCacheServer(t *testing.T, prompts map[string][]float32) (*client.Clie
 	addr := ln.Addr().String()
 	ln.Close()
 	st := store.New()
-	srv := New(st, Config{Addr: addr, Embed: embed.New(embed.Config{URL: fake.URL})})
+	srv := New(st, Config{Addr: addr, Embed: embed.New(embed.Config{URL: fake.URL}), SCacheMax: max})
 	ctx, cancel := context.WithCancel(context.Background())
 	go srv.ListenAndServe(ctx)
 
@@ -1364,5 +1370,53 @@ func TestSCacheExpiry(t *testing.T) {
 	mustDo(t, cli, "SCACHE.SET", "p1", "cached answer", "TTL", "3600")
 	if r := mustDo(t, cli, "SCACHE.GET", "p1"); r != "cached answer" {
 		t.Fatalf("SCACHE.GET live = %v", r)
+	}
+}
+
+func TestSCacheCap(t *testing.T) {
+	basis := func(i int) []float32 {
+		v := make([]float32, 8)
+		v[i] = 1
+		return v
+	}
+	// Orthogonal embeddings, so each prompt only ever matches its own entry.
+	cli, st, cleanup := startSCacheServerMax(t, map[string][]float32{
+		"p0": basis(0), "p1": basis(1), "p2": basis(2), "p3": basis(3),
+	}, 2)
+	defer cleanup()
+
+	mustDo(t, cli, "SCACHE.SET", "p0", "r0")
+	mustDo(t, cli, "SCACHE.SET", "p1", "r1")
+	// Refresh p0, making p1 the least recently used.
+	if r := mustDo(t, cli, "SCACHE.GET", "p0"); r != "r0" {
+		t.Fatalf("SCACHE.GET p0 = %v", r)
+	}
+
+	// A third distinct prompt pushes the cache over the cap of 2.
+	mustDo(t, cli, "SCACHE.SET", "p2", "r2")
+	if n, _ := st.VCard("__scache__"); n != 2 {
+		t.Fatalf("VCARD after overflow = %d, want the cap of 2", n)
+	}
+	// The LRU entry is the one gone; the refreshed one survived.
+	if r, err := cli.Do("SCACHE.GET", "p1"); err != nil || r != nil {
+		t.Fatalf("SCACHE.GET evicted = %v %v, want nil", r, err)
+	}
+	if r := mustDo(t, cli, "SCACHE.GET", "p0"); r != "r0" {
+		t.Fatalf("SCACHE.GET survivor = %v", r)
+	}
+
+	// Sustained distinct prompts hold the cache at the cap.
+	mustDo(t, cli, "SCACHE.SET", "p3", "r3")
+	if n, _ := st.VCard("__scache__"); n != 2 {
+		t.Fatalf("VCARD after sustained prompts = %d, want 2", n)
+	}
+
+	// Replacing an existing prompt does not grow the cache or evict anyone.
+	mustDo(t, cli, "SCACHE.SET", "p3", "r3-updated")
+	if n, _ := st.VCard("__scache__"); n != 2 {
+		t.Fatalf("VCARD after replace = %d, want 2", n)
+	}
+	if r := mustDo(t, cli, "SCACHE.GET", "p3"); r != "r3-updated" {
+		t.Fatalf("SCACHE.GET replaced = %v", r)
 	}
 }

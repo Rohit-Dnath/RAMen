@@ -165,7 +165,13 @@ Hits and misses are counted and surfaced via `INFO` and the dashboard.
 
 An entry past its TTL stops matching immediately, and the background expiry
 sweeper reclaims its memory even if it is never queried again. Entries without
-a TTL stay until replaced or deleted.
+a TTL stay until replaced, deleted, or evicted by the cap below.
+
+The cache is bounded: past `--scache-max` entries (`RAMEN_SCACHE_MAX`, default
+10000), each new prompt evicts approximately the least-recently-used entry,
+reclaiming expired ones first. A cache hit refreshes an entry's position. Set
+the cap to `0` to make the cache unbounded. Plain `VSET` collections are never
+capped.
 
 ### Dollar-savings demo
 
