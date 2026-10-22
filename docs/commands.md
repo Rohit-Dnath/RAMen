@@ -88,7 +88,18 @@ LINSERT q BEFORE b Z   # insert Z before the first "b"; returns new length, or -
 
 ## Sets
 
-`SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`.
+| Command | Description |
+|---|---|
+| `SADD <key> <member ...>` | Add members; returns the number newly added. |
+| `SREM <key> <member ...>` | Remove members; returns the number removed. |
+| `SMEMBERS <key>` | All members. |
+| `SISMEMBER <key> <member>` | `1` if the member is in the set, else `0`. |
+| `SCARD <key>` | Number of members. |
+| `SINTER <key> [key ...]` | Members present in every set; a missing key is an empty set. |
+| `SUNION <key> [key ...]` | Distinct members across all the sets. |
+| `SDIFF <key> [key ...]` | Members of the first set that are in none of the rest. |
+| `SPOP <key> [count]` | Remove and return one random member, or an array of up to `count`. |
+| `SRANDMEMBER <key> [count]` | Return random member(s) without removing; a negative `count` allows repeats, capped at 2^20 per call. |
 
 ## Sorted sets
 

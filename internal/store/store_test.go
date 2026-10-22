@@ -864,3 +864,194 @@ func TestZCount(t *testing.T) {
 		t.Fatalf("ZCount wrong type = %v", err)
 	}
 }
+
+// sameSet reports whether got contains exactly the want members, in any order.
+func sameSet(got []string, want ...string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	m := make(map[string]bool, len(got))
+	for _, g := range got {
+		m[g] = true
+	}
+	for _, w := range want {
+		if !m[w] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestSetAlgebra(t *testing.T) {
+	s := New()
+	s.SAdd("a", "1", "2", "3")
+	s.SAdd("b", "2", "3", "4")
+	s.SAdd("c", "3", "4", "5")
+
+	check := func(label string, got []string, err error, want ...string) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: unexpected error %v", label, err)
+		}
+		if !sameSet(got, want...) {
+			t.Fatalf("%s = %v, want %v", label, got, want)
+		}
+	}
+
+	r, err := s.SInter([]string{"a", "b", "c"})
+	check("SInter abc", r, err, "3")
+	r, err = s.SInter([]string{"a", "b"})
+	check("SInter ab", r, err, "2", "3")
+	r, err = s.SInter([]string{"a", "nope"}) // missing key -> empty
+	check("SInter missing", r, err)
+	s.SAdd("disjoint", "9")
+	r, err = s.SInter([]string{"a", "disjoint"}) // non-empty but no overlap -> empty
+	check("SInter disjoint", r, err)
+	r, err = s.SInter([]string{"a"}) // single key -> the set itself
+	check("SInter single", r, err, "1", "2", "3")
+
+	r, err = s.SUnion([]string{"a", "b"})
+	check("SUnion ab", r, err, "1", "2", "3", "4")
+	r, err = s.SUnion([]string{"a", "nope"})
+	check("SUnion missing", r, err, "1", "2", "3")
+
+	r, err = s.SDiff([]string{"a", "b"})
+	check("SDiff ab", r, err, "1")
+	r, err = s.SDiff([]string{"a", "b", "c"})
+	check("SDiff abc", r, err, "1")
+	r, err = s.SDiff([]string{"nope", "a"}) // missing first -> empty
+	check("SDiff missing-first", r, err)
+	r, err = s.SDiff([]string{"a", "nope"}) // missing other -> first unchanged
+	check("SDiff missing-other", r, err, "1", "2", "3")
+
+	// a WRONGTYPE key anywhere fails the whole op
+	s.Set("str", "v", SetOptions{})
+	if _, err := s.SInter([]string{"a", "str"}); err != ErrWrongType {
+		t.Fatalf("SInter wrong type = %v", err)
+	}
+	if _, err := s.SUnion([]string{"str"}); err != ErrWrongType {
+		t.Fatalf("SUnion wrong type = %v", err)
+	}
+	if _, err := s.SDiff([]string{"str", "a"}); err != ErrWrongType {
+		t.Fatalf("SDiff wrong type = %v", err)
+	}
+	// A missing key never shields a wrong-typed key after it: every key is
+	// type-checked before the result is decided, so the reply does not depend
+	// on argument order and all three commands agree, matching Redis.
+	if _, err := s.SInter([]string{"a", "nope", "str"}); err != ErrWrongType {
+		t.Fatalf("SInter missing-before-wrongtype = %v, want WRONGTYPE", err)
+	}
+	if _, err := s.SInter([]string{"a", "str", "nope"}); err != ErrWrongType {
+		t.Fatalf("SInter wrongtype-before-missing = %v, want WRONGTYPE", err)
+	}
+	if _, err := s.SUnion([]string{"a", "nope", "str"}); err != ErrWrongType {
+		t.Fatalf("SUnion missing-before-wrongtype = %v, want WRONGTYPE", err)
+	}
+	if _, err := s.SDiff([]string{"a", "nope", "str"}); err != ErrWrongType {
+		t.Fatalf("SDiff missing-before-wrongtype = %v, want WRONGTYPE", err)
+	}
+}
+
+func hasDup(xs []string) bool {
+	seen := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		if seen[x] {
+			return true
+		}
+		seen[x] = true
+	}
+	return false
+}
+
+func TestSetPopRandom(t *testing.T) {
+	s := New()
+
+	// missing key
+	if r, err := s.SPop("nope", 1); err != nil || r != nil {
+		t.Fatalf("SPop missing = %v %v", r, err)
+	}
+	if r, err := s.SRandMember("nope", 1); err != nil || r != nil {
+		t.Fatalf("SRandMember missing = %v %v", r, err)
+	}
+
+	s.SAdd("s", "a", "b", "c", "d")
+
+	// SRandMember never modifies the set and returns real members
+	r, err := s.SRandMember("s", 2)
+	if err != nil || len(r) != 2 || hasDup(r) {
+		t.Fatalf("SRandMember 2 = %v %v", r, err)
+	}
+	for _, m := range r {
+		if ok, _ := s.SIsMember("s", m); !ok {
+			t.Fatalf("SRandMember returned a non-member %q", m)
+		}
+	}
+	if n, _ := s.SCard("s"); n != 4 {
+		t.Fatal("SRandMember modified the set")
+	}
+	// a positive count larger than the set returns all members, still distinct
+	r, _ = s.SRandMember("s", 100)
+	if len(r) != 4 || hasDup(r) {
+		t.Fatalf("SRandMember over-count = %v, want 4 distinct", r)
+	}
+	// a negative count returns exactly -count members (repeats allowed)
+	r, _ = s.SRandMember("s", -10)
+	if len(r) != 10 {
+		t.Fatalf("SRandMember -10 = %d members, want 10", len(r))
+	}
+	// count 0 is empty
+	if r, _ := s.SRandMember("s", 0); len(r) != 0 {
+		t.Fatalf("SRandMember 0 = %v", r)
+	}
+	// a huge negative count errors rather than allocating unbounded / overflowing
+	if _, err := s.SRandMember("s", math.MinInt64); err != ErrSampleCount {
+		t.Fatalf("SRandMember min-int64 = %v, want ErrSampleCount", err)
+	}
+	// but the cap fires only after the key/type check: a missing key is still
+	// empty, and a wrong type is still WRONGTYPE, even with a huge count.
+	if r, err := s.SRandMember("nope", math.MinInt64); err != nil || r != nil {
+		t.Fatalf("SRandMember missing huge = %v %v, want nil nil", r, err)
+	}
+	s.Set("str", "v", SetOptions{})
+	if _, err := s.SRandMember("str", math.MinInt64); err != ErrWrongType {
+		t.Fatalf("SRandMember wrong-type huge = %v, want WRONGTYPE", err)
+	}
+
+	// SPop removes what it returns
+	popped, err := s.SPop("s", 2)
+	if err != nil || len(popped) != 2 || hasDup(popped) {
+		t.Fatalf("SPop 2 = %v %v", popped, err)
+	}
+	for _, m := range popped {
+		if ok, _ := s.SIsMember("s", m); ok {
+			t.Fatalf("SPop did not remove %q", m)
+		}
+	}
+	if n, _ := s.SCard("s"); n != 2 {
+		t.Fatalf("SPop left %d members, want 2", n)
+	}
+	// SPop of the whole set deletes the key
+	if popped, _ := s.SPop("s", 100); len(popped) != 2 {
+		t.Fatalf("SPop all = %v", popped)
+	}
+	if s.Exists("s") != 0 {
+		t.Fatal("SPop emptying the set should delete the key")
+	}
+	// SPop 0 removes nothing
+	s.SAdd("s2", "x")
+	if popped, _ := s.SPop("s2", 0); len(popped) != 0 {
+		t.Fatalf("SPop 0 = %v", popped)
+	}
+	if n, _ := s.SCard("s2"); n != 1 {
+		t.Fatal("SPop 0 modified the set")
+	}
+
+	// WRONGTYPE
+	s.Set("str", "v", SetOptions{})
+	if _, err := s.SPop("str", 1); err != ErrWrongType {
+		t.Fatalf("SPop wrong type = %v", err)
+	}
+	if _, err := s.SRandMember("str", 1); err != ErrWrongType {
+		t.Fatalf("SRandMember wrong type = %v", err)
+	}
+}

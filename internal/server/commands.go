@@ -92,11 +92,16 @@ func (s *Server) registerCommands() {
 		"LINSERT": (*conn).cmdLInsert,
 
 		// sets
-		"SADD":      (*conn).cmdSAdd,
-		"SREM":      (*conn).cmdSRem,
-		"SMEMBERS":  (*conn).cmdSMembers,
-		"SISMEMBER": (*conn).cmdSIsMember,
-		"SCARD":     (*conn).cmdSCard,
+		"SADD":        (*conn).cmdSAdd,
+		"SREM":        (*conn).cmdSRem,
+		"SMEMBERS":    (*conn).cmdSMembers,
+		"SISMEMBER":   (*conn).cmdSIsMember,
+		"SCARD":       (*conn).cmdSCard,
+		"SINTER":      (*conn).cmdSInter,
+		"SUNION":      (*conn).cmdSUnion,
+		"SDIFF":       (*conn).cmdSDiff,
+		"SPOP":        (*conn).cmdSPop,
+		"SRANDMEMBER": (*conn).cmdSRandMember,
 
 		// sorted sets
 		"ZADD":          (*conn).cmdZAdd,

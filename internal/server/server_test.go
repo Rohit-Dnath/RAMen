@@ -1017,3 +1017,157 @@ func TestZRangeByScoreInfinities(t *testing.T) {
 	// a NaN bound is rejected rather than silently matching nothing.
 	mustError(t, cli, "ZRANGEBYSCORE", "z", "nan", "1")
 }
+
+// sameReply reports whether an array reply holds exactly the want members, in
+// any order (set replies are unordered).
+func sameReply(r any, want ...string) bool {
+	arr, ok := r.([]any)
+	if !ok {
+		return r == nil && len(want) == 0
+	}
+	if len(arr) != len(want) {
+		return false
+	}
+	m := make(map[string]bool, len(arr))
+	for _, e := range arr {
+		if s, ok := e.(string); ok {
+			m[s] = true
+		}
+	}
+	for _, w := range want {
+		if !m[w] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestSetAlgebra(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	mustDo(t, cli, "SADD", "a", "1", "2", "3")
+	mustDo(t, cli, "SADD", "b", "2", "3", "4")
+
+	if r := mustDo(t, cli, "SINTER", "a", "b"); !sameReply(r, "2", "3") {
+		t.Fatalf("SINTER = %v", r)
+	}
+	if r := mustDo(t, cli, "SUNION", "a", "b"); !sameReply(r, "1", "2", "3", "4") {
+		t.Fatalf("SUNION = %v", r)
+	}
+	if r := mustDo(t, cli, "SDIFF", "a", "b"); !sameReply(r, "1") {
+		t.Fatalf("SDIFF = %v", r)
+	}
+	// a missing key is treated as an empty set
+	if r := mustDo(t, cli, "SINTER", "a", "nope"); !sameReply(r) {
+		t.Fatalf("SINTER with missing key = %v, want empty", r)
+	}
+	if r := mustDo(t, cli, "SUNION", "a", "nope"); !sameReply(r, "1", "2", "3") {
+		t.Fatalf("SUNION with missing key = %v", r)
+	}
+
+	// single-key forms return the set itself
+	if r := mustDo(t, cli, "SUNION", "a"); !sameReply(r, "1", "2", "3") {
+		t.Fatalf("SUNION single = %v", r)
+	}
+
+	// WRONGTYPE and arity for every op
+	mustDo(t, cli, "SET", "str", "v")
+	mustError(t, cli, "SINTER", "a", "str")
+	mustError(t, cli, "SUNION", "a", "str")
+	mustError(t, cli, "SDIFF", "a", "str")
+	mustError(t, cli, "SINTER")
+	mustError(t, cli, "SUNION")
+	mustError(t, cli, "SDIFF")
+
+	// a missing key does not shield a wrong-typed key after it: every key is
+	// type-checked, so the reply does not depend on argument order
+	mustError(t, cli, "SINTER", "a", "nope", "str")
+	mustError(t, cli, "SINTER", "a", "str", "nope")
+	mustError(t, cli, "SUNION", "a", "nope", "str")
+	mustError(t, cli, "SDIFF", "a", "nope", "str")
+}
+
+func TestSetPopRandom(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	members := map[string]bool{"a": true, "b": true, "c": true, "d": true}
+
+	// missing key: no-count form is nil, count form is an empty array
+	if r, err := cli.Do("SPOP", "nope"); err != nil || r != nil {
+		t.Fatalf("SPOP missing = %v", r)
+	}
+	if r, err := cli.Do("SRANDMEMBER", "nope"); err != nil || r != nil {
+		t.Fatalf("SRANDMEMBER missing = %v", r)
+	}
+	if r := mustDo(t, cli, "SPOP", "nope", "2"); !sameReply(r) {
+		t.Fatalf("SPOP missing count = %v, want empty array", r)
+	}
+
+	mustDo(t, cli, "SADD", "s", "a", "b", "c", "d")
+
+	// SRANDMEMBER no count -> a single member (bulk), set unchanged
+	if r := mustDo(t, cli, "SRANDMEMBER", "s"); !members[r.(string)] {
+		t.Fatalf("SRANDMEMBER = %v", r)
+	}
+	if r := mustDo(t, cli, "SCARD", "s"); r != int64(4) {
+		t.Fatalf("SRANDMEMBER modified the set = %v", r)
+	}
+	// count form is an array of distinct members
+	if arr := mustDo(t, cli, "SRANDMEMBER", "s", "3").([]any); len(arr) != 3 || replyHasDup(arr) {
+		t.Fatalf("SRANDMEMBER 3 = %v, want 3 distinct", arr)
+	}
+	// negative count returns exactly |count| members
+	if arr := mustDo(t, cli, "SRANDMEMBER", "s", "-6").([]any); len(arr) != 6 {
+		t.Fatalf("SRANDMEMBER -6 = %d, want 6", len(arr))
+	}
+
+	// SPOP no count removes one member
+	before := mustDo(t, cli, "SCARD", "s").(int64)
+	if r := mustDo(t, cli, "SPOP", "s"); !members[r.(string)] {
+		t.Fatalf("SPOP = %v", r)
+	}
+	if after := mustDo(t, cli, "SCARD", "s").(int64); after != before-1 {
+		t.Fatalf("SPOP removed the wrong count: before=%d after=%d", before, after)
+	}
+	// SPOP count form is an array
+	if arr := mustDo(t, cli, "SPOP", "s", "2").([]any); len(arr) != 2 {
+		t.Fatalf("SPOP 2 = %v", arr)
+	}
+
+	// SPOP with count 0 removes nothing and leaves the set
+	mustDo(t, cli, "SADD", "z0", "m")
+	if arr := mustDo(t, cli, "SPOP", "z0", "0").([]any); len(arr) != 0 {
+		t.Fatalf("SPOP 0 = %v, want empty", arr)
+	}
+	if r := mustDo(t, cli, "SCARD", "z0"); r != int64(1) {
+		t.Fatalf("SPOP 0 modified the set = %v", r)
+	}
+
+	// errors
+	mustError(t, cli, "SPOP", "s", "-1")                 // negative count
+	mustError(t, cli, "SPOP", "s", "notanint")           // bad count
+	mustError(t, cli, "SRANDMEMBER", "s", "notanint")    // bad count
+	mustError(t, cli, "SRANDMEMBER", "s", "-9999999999") // magnitude too large
+	mustDo(t, cli, "SET", "str", "v")
+	mustError(t, cli, "SPOP", "str")             // WRONGTYPE
+	mustError(t, cli, "SRANDMEMBER", "str")      // WRONGTYPE
+	mustError(t, cli, "SPOP")                    // arity
+	mustError(t, cli, "SPOP", "s", "1", "extra") // arity
+	mustError(t, cli, "SRANDMEMBER")             // arity
+	mustError(t, cli, "SRANDMEMBER", "s", "1", "extra")
+}
+
+// replyHasDup reports whether an array reply contains a duplicate string.
+func replyHasDup(arr []any) bool {
+	seen := make(map[string]bool, len(arr))
+	for _, e := range arr {
+		s, _ := e.(string)
+		if seen[s] {
+			return true
+		}
+		seen[s] = true
+	}
+	return false
+}
