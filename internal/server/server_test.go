@@ -1022,6 +1022,37 @@ func TestZRangeByScoreInfinities(t *testing.T) {
 	mustError(t, cli, "ZRANGEBYSCORE", "z", "nan", "1")
 }
 
+func TestZAddNaN(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// NaN compares false against everything, so one NaN score would leave
+	// ZRANGE, ZRANK and ZCOUNT disagreeing about the set's order (#60).
+	for _, nan := range []string{"nan", "NaN", "-nan", "+nan"} {
+		if e := mustError(t, cli, "ZADD", "z", nan, "a"); e.Error() != "ERR value is not a valid float" {
+			t.Fatalf("ZADD %s error = %q", nan, e.Error())
+		}
+	}
+	if r := mustDo(t, cli, "EXISTS", "z"); r != int64(0) {
+		t.Fatalf("a rejected ZADD created the key = %v", r)
+	}
+
+	// a NaN in any pair rejects the whole command: nothing is written
+	mustDo(t, cli, "ZADD", "z", "1", "a")
+	mustError(t, cli, "ZADD", "z", "2", "b", "nan", "c", "3", "a")
+	if r := mustDo(t, cli, "ZCARD", "z"); r != int64(1) {
+		t.Fatalf("ZADD with a NaN pair partially wrote = %v members, want 1", r)
+	}
+	if r := mustDo(t, cli, "ZSCORE", "z", "a"); r != "1" {
+		t.Fatalf("ZADD with a NaN pair changed a's score = %v, want 1", r)
+	}
+
+	// infinities are still valid scores
+	if r := mustDo(t, cli, "ZADD", "z", "inf", "hi", "-inf", "lo"); r != int64(2) {
+		t.Fatalf("ZADD infinities = %v, want 2", r)
+	}
+}
+
 // sameReply reports whether an array reply holds exactly the want members, in
 // any order (set replies are unordered).
 func sameReply(r any, want ...string) bool {
