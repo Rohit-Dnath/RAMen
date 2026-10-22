@@ -2,8 +2,9 @@ package store
 
 import "github.com/Rohit-Dnath/RAMen/internal/vector"
 
-// VSet stores a vector under id within the collection at key.
-func (s *Store) VSet(key, id string, vec []float32, meta string) error {
+// VSet stores a vector under id within the collection at key. expireUnix is
+// the Unix second the item expires at, 0 for no expiry.
+func (s *Store) VSet(key, id string, vec []float32, meta string, expireUnix int64) error {
 	sh := s.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -19,7 +20,7 @@ func (s *Store) VSet(key, id string, vec []float32, meta string) error {
 		c = vector.NewCollection()
 		sh.m[key] = &entry{val: c}
 	}
-	return c.Set(id, vec, meta)
+	return c.Set(id, vec, meta, expireUnix)
 }
 
 // VSearch returns the top-k nearest vectors in the collection at key.
@@ -35,7 +36,7 @@ func (s *Store) VSearch(key string, query []float32, k int) ([]vector.Result, er
 	if !ok {
 		return nil, ErrWrongType
 	}
-	return c.Search(query, k)
+	return c.Search(query, k, s.now().Unix())
 }
 
 // VDel removes a vector id from the collection at key.

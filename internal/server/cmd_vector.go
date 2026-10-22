@@ -47,7 +47,7 @@ func (c *conn) cmdVSet(args []string) error {
 		}
 		meta = args[i+1]
 	}
-	if err := c.s.store.VSet(key, id, vec, meta); err != nil {
+	if err := c.s.store.VSet(key, id, vec, meta, 0); err != nil {
 		return c.storeErr(err)
 	}
 	return c.writeSimple("OK")

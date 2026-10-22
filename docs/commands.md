@@ -163,6 +163,10 @@ retrieves responses keyed by prompt *meaning*.
 
 Hits and misses are counted and surfaced via `INFO` and the dashboard.
 
+An entry past its TTL stops matching immediately, and the background expiry
+sweeper reclaims its memory even if it is never queried again. Entries without
+a TTL stay until replaced or deleted.
+
 ### Dollar-savings demo
 
 ```

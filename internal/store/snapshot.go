@@ -27,6 +27,10 @@ type VecRecord struct {
 	ID   string
 	Vec  []float32
 	Meta string
+	// ExpireUnix is the Unix second the item expires at; 0 == no expiry.
+	// Snapshots written before this field existed simply lack it, and gob
+	// decodes a missing field as 0, so old entries load as never expiring.
+	ExpireUnix int64
 }
 
 // Export returns a snapshot of every live key. It is safe to call while the
@@ -84,7 +88,16 @@ func (s *Store) Export() []Record {
 			case *vector.Collection:
 				rec.Type, rec.VecDim = "vector", v.Dim
 				for _, it := range v.Items() {
-					rec.Vectors = append(rec.Vectors, VecRecord{ID: it.ID, Vec: it.Vec, Meta: it.Meta})
+					// An item already expired at save time is garbage awaiting
+					// the sweeper; keep it out of the snapshot.
+					if it.ExpireUnix != 0 && now.Unix() > it.ExpireUnix {
+						continue
+					}
+					rec.Vectors = append(rec.Vectors, VecRecord{ID: it.ID, Vec: it.Vec, Meta: it.Meta, ExpireUnix: it.ExpireUnix})
+				}
+				if len(rec.Vectors) == 0 {
+					// Every item was expired; don't resurrect an empty key.
+					continue
 				}
 			default:
 				continue
@@ -107,7 +120,7 @@ func (s *Store) Import(recs []Record) {
 				continue
 			}
 		}
-		val := recordValue(rec)
+		val := recordValue(rec, now.Unix())
 		if val == nil {
 			continue
 		}
@@ -118,7 +131,7 @@ func (s *Store) Import(recs []Record) {
 	}
 }
 
-func recordValue(rec Record) value {
+func recordValue(rec Record, nowUnix int64) value {
 	switch rec.Type {
 	case "string":
 		return rec.Str
@@ -144,7 +157,14 @@ func recordValue(rec Record) value {
 	case "vector":
 		c := vector.NewCollection()
 		for _, vr := range rec.Vectors {
-			c.Set(vr.ID, vr.Vec, vr.Meta)
+			// Skip items whose deadline passed while the snapshot sat on disk.
+			if vr.ExpireUnix != 0 && nowUnix > vr.ExpireUnix {
+				continue
+			}
+			c.Set(vr.ID, vr.Vec, vr.Meta, vr.ExpireUnix)
+		}
+		if c.Len() == 0 {
+			return nil
 		}
 		return c
 	default:

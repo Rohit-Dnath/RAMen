@@ -2,13 +2,17 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/Rohit-Dnath/RAMen/internal/client"
+	"github.com/Rohit-Dnath/RAMen/internal/embed"
 	"github.com/Rohit-Dnath/RAMen/internal/store"
 )
 
@@ -1272,4 +1276,93 @@ func TestRandomKey(t *testing.T) {
 	}
 
 	mustError(t, cli, "RANDOMKEY", "extra") // arity: takes no arguments
+}
+
+// startSCacheServer boots a server wired to a fake embeddings provider that
+// returns a fixed vector per known prompt, so cosine scores in tests are
+// exact. It returns a connected client, the underlying store, and a cleanup.
+func startSCacheServer(t *testing.T, prompts map[string][]float32) (*client.Client, *store.Store, func()) {
+	t.Helper()
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input string `json:"input"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		vec, ok := prompts[req.Input]
+		if !ok {
+			t.Errorf("unexpected prompt embedded: %q", req.Input)
+			vec = []float32{0, 0}
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"embedding": vec}},
+		})
+	}))
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	st := store.New()
+	srv := New(st, Config{Addr: addr, Embed: embed.New(embed.Config{URL: fake.URL})})
+	ctx, cancel := context.WithCancel(context.Background())
+	go srv.ListenAndServe(ctx)
+
+	var cli *client.Client
+	for i := 0; i < 50; i++ {
+		if cli, err = client.Dial(addr); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		cancel()
+		fake.Close()
+		t.Fatalf("dial: %v", err)
+	}
+	return cli, st, func() { cli.Close(); cancel(); fake.Close() }
+}
+
+func TestSCacheExpiry(t *testing.T) {
+	cli, st, cleanup := startSCacheServer(t, map[string][]float32{
+		"p1":   {1, 0},
+		"near": {0.8, 0.6}, // cosine 0.8 against p1
+	})
+	defer cleanup()
+
+	// A TTL that is non-positive, overflows time.Duration, or is not an
+	// integer is rejected up front, like SETEX.
+	mustError(t, cli, "SCACHE.SET", "p1", "r", "TTL", "0")
+	mustError(t, cli, "SCACHE.SET", "p1", "r", "TTL", "-1")
+	mustError(t, cli, "SCACHE.SET", "p1", "r", "TTL", "9223372036854775807")
+	mustError(t, cli, "SCACHE.SET", "p1", "r", "TTL", "ten")
+	if n, _ := st.VCard("__scache__"); n != 0 {
+		t.Fatalf("rejected TTL still wrote an entry: VCARD = %d", n)
+	}
+
+	// An entry whose item deadline has already passed is invisible to
+	// SCACHE.GET even though it is still in the collection awaiting sweep.
+	st.VSet("__scache__", "p1", []float32{1, 0}, `{"r":"resp"}`, 1)
+	if r, err := cli.Do("SCACHE.GET", "p1"); err != nil || r != nil {
+		t.Fatalf("SCACHE.GET expired = %v %v, want nil", r, err)
+	}
+
+	// A pre-upgrade entry carries its deadline only in the meta JSON. Even
+	// scoring below the threshold, the lookup must reclaim it: the top-1 here
+	// scores 0.8 against THRESHOLD 0.9 and is expired, so the reply is nil
+	// AND the entry is gone afterwards.
+	st.VSet("__scache__", "p1", []float32{1, 0}, `{"r":"resp","exp":1}`, 0)
+	if r, err := cli.Do("SCACHE.GET", "near", "THRESHOLD", "0.9"); err != nil || r != nil {
+		t.Fatalf("SCACHE.GET legacy below-threshold = %v %v, want nil", r, err)
+	}
+	if n, _ := st.VCard("__scache__"); n != 0 {
+		t.Fatalf("legacy expired entry not reclaimed: VCARD = %d, want 0", n)
+	}
+
+	// A TTL'd entry still hits before its deadline.
+	mustDo(t, cli, "SCACHE.SET", "p1", "cached answer", "TTL", "3600")
+	if r := mustDo(t, cli, "SCACHE.GET", "p1"); r != "cached answer" {
+		t.Fatalf("SCACHE.GET live = %v", r)
+	}
 }

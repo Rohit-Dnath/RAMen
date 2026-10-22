@@ -320,7 +320,7 @@ func TestSnapshotRoundtrip(t *testing.T) {
 	s.RPush("l", "a", "b")
 	s.SAdd("set", "x", "y")
 	s.ZAdd("z", []ZMember{{Member: "m", Score: 1.5}})
-	s.VSet("vec", "id1", []float32{1, 2, 3}, "meta")
+	s.VSet("vec", "id1", []float32{1, 2, 3}, "meta", 0)
 
 	recs := s.Export()
 	s2 := New()
@@ -1283,5 +1283,96 @@ func TestRandomKey(t *testing.T) {
 	cur = cur.Add(2 * time.Second)
 	if _, ok := s.RandomKey(); ok {
 		t.Fatal("RandomKey with only expired keys should be ok=false")
+	}
+}
+
+func TestVectorExpirySweep(t *testing.T) {
+	s := New()
+	cur := time.Unix(1000, 0)
+	s.now = func() time.Time { return cur }
+
+	s.VSet("cache", "temp", []float32{1, 0}, "m", 1060)
+	s.VSet("cache", "keep", []float32{0, 1}, "m", 0)
+	s.VSet("gone", "only", []float32{1, 1}, "m", 1030)
+
+	// Expired items stop matching the moment their deadline passes, before
+	// any sweep runs, so an expired entry cannot outrank a live one.
+	cur = time.Unix(1061, 0)
+	res, err := s.VSearch("cache", []float32{1, 0}, 1)
+	if err != nil || len(res) != 1 || res[0].Item.ID != "keep" {
+		t.Fatalf("VSearch after expiry = %v %v, want keep only", res, err)
+	}
+
+	// The sweeper reclaims expired items without anyone querying them.
+	s.sweep()
+	if n, _ := s.VCard("cache"); n != 1 {
+		t.Fatalf("VCard after sweep = %d, want 1", n)
+	}
+	// A collection whose items all expired drops the key entirely.
+	if s.Exists("gone") != 0 {
+		t.Fatal("sweep left an empty vector key behind")
+	}
+	// Items with no expiry survive any amount of time.
+	cur = time.Unix(1e9, 0)
+	s.sweep()
+	if n, _ := s.VCard("cache"); n != 1 {
+		t.Fatalf("sweep removed the immortal item: VCard = %d", n)
+	}
+}
+
+func TestVectorExpirySnapshot(t *testing.T) {
+	s := New()
+	cur := time.Unix(1000, 0)
+	s.now = func() time.Time { return cur }
+	s.VSet("v", "dead", []float32{1, 0}, "m", 1010)
+	s.VSet("v", "live", []float32{0, 1}, "m", 2000)
+	s.VSet("v", "forever", []float32{1, 1}, "m", 0)
+
+	// A collection whose items are all dead at save time writes no record.
+	s.VSet("allgone", "x", []float32{1, 0}, "m", 1005)
+
+	// Items already expired at save time are not written out.
+	cur = time.Unix(1020, 0)
+	var vrec *Record
+	recs := s.Export()
+	for i := range recs {
+		if recs[i].Key == "v" {
+			vrec = &recs[i]
+		}
+		if recs[i].Key == "allgone" {
+			t.Fatalf("an all-expired collection was exported: %+v", recs[i])
+		}
+	}
+	if vrec == nil || len(vrec.Vectors) != 2 {
+		t.Fatalf("exported vectors = %+v, want live and forever only", vrec)
+	}
+
+	// Deadlines survive the round-trip: a store loading the snapshot past
+	// live's deadline skips it, and forever stays.
+	s2 := New()
+	cur2 := time.Unix(3000, 0)
+	s2.now = func() time.Time { return cur2 }
+	s2.Import(recs)
+	if n, _ := s2.VCard("v"); n != 1 {
+		t.Fatalf("VCard after import past a deadline = %d, want 1", n)
+	}
+	if res, _ := s2.VSearch("v", []float32{1, 1}, 10); len(res) != 1 || res[0].Item.ID != "forever" {
+		t.Fatalf("VSearch after import = %v, want forever only", res)
+	}
+
+	// A record written before the expiry field existed decodes with
+	// ExpireUnix 0 and must load as never expiring.
+	s2.Import([]Record{{Key: "old", Type: "vector", VecDim: 2,
+		Vectors: []VecRecord{{ID: "x", Vec: []float32{1, 0}, Meta: "m"}}}})
+	s2.sweep()
+	if n, _ := s2.VCard("old"); n != 1 {
+		t.Fatalf("pre-upgrade record did not load as immortal: VCard = %d", n)
+	}
+
+	// An all-expired collection resurrects no key at load.
+	s2.Import([]Record{{Key: "husk", Type: "vector", VecDim: 2,
+		Vectors: []VecRecord{{ID: "x", Vec: []float32{1, 0}, Meta: "m", ExpireUnix: 5}}}})
+	if s2.Exists("husk") != 0 {
+		t.Fatal("an all-expired collection loaded as an empty key")
 	}
 }

@@ -15,12 +15,19 @@ import (
 var ErrDimMismatch = errors.New("vector dimension mismatch")
 
 // Item is one stored vector, its id, and optional metadata (used by the
-// semantic cache to stash the cached response and its expiry).
+// semantic cache to stash the cached response).
 type Item struct {
-	ID   string
-	Vec  []float32
-	Meta string
-	norm float64 // Euclidean norm of Vec, cached at insert time; not persisted
+	ID         string
+	Vec        []float32
+	Meta       string
+	ExpireUnix int64   // Unix seconds the item expires at; 0 == no expiry
+	norm       float64 // Euclidean norm of Vec, cached at insert time; not persisted
+}
+
+// expired reports whether the item's deadline has passed at nowUnix. A zero
+// deadline never expires, and a zero nowUnix disables expiry checking.
+func (it *Item) expired(nowUnix int64) bool {
+	return it.ExpireUnix != 0 && nowUnix > it.ExpireUnix
 }
 
 // Collection is a flat index of vectors that all share one dimension.
@@ -37,7 +44,8 @@ func NewCollection() *Collection {
 
 // Set inserts or replaces the vector stored under id. The first vector added
 // to an empty collection fixes its dimension; later vectors must match.
-func (c *Collection) Set(id string, vec []float32, meta string) error {
+// expireUnix is the Unix second the item expires at, 0 for no expiry.
+func (c *Collection) Set(id string, vec []float32, meta string, expireUnix int64) error {
 	if c.Dim == 0 {
 		c.Dim = len(vec)
 	} else if len(vec) != c.Dim {
@@ -45,8 +53,21 @@ func (c *Collection) Set(id string, vec []float32, meta string) error {
 	}
 	cp := make([]float32, len(vec))
 	copy(cp, vec)
-	c.items[id] = &Item{ID: id, Vec: cp, Meta: meta, norm: norm(cp)}
+	c.items[id] = &Item{ID: id, Vec: cp, Meta: meta, ExpireUnix: expireUnix, norm: norm(cp)}
 	return nil
+}
+
+// SweepExpired removes every item whose deadline is past at nowUnix and
+// returns how many were removed. Items with no expiry are untouched.
+func (c *Collection) SweepExpired(nowUnix int64) int {
+	removed := 0
+	for id, it := range c.items {
+		if it.expired(nowUnix) {
+			delete(c.items, id)
+			removed++
+		}
+	}
+	return removed
 }
 
 // norm returns the Euclidean norm (magnitude) of v.
@@ -79,7 +100,10 @@ type Result struct {
 }
 
 // Search returns the top-k items by cosine similarity to query, highest first.
-func (c *Collection) Search(query []float32, k int) ([]Result, error) {
+// Items whose expiry is past at nowUnix are skipped, so an expired entry can
+// never win a slot over a live one; nowUnix 0 disables the check. Skipped items
+// stay in the collection — reclaiming them is the sweeper's job.
+func (c *Collection) Search(query []float32, k int, nowUnix int64) ([]Result, error) {
 	if c.Dim != 0 && len(query) != c.Dim {
 		return nil, ErrDimMismatch
 	}
@@ -97,6 +121,9 @@ func (c *Collection) Search(query []float32, k int) ([]Result, error) {
 	// allocation proportional to the whole collection.
 	h := make(topK, 0, k)
 	for _, it := range c.items {
+		if it.expired(nowUnix) {
+			continue
+		}
 		s := cosineNorm(query, qn, it)
 		if len(h) < k {
 			heap.Push(&h, Result{Item: it, Score: s})

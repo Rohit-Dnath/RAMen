@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +43,12 @@ func (c *conn) cmdSCacheSet(args []string) error {
 		if err != nil {
 			return c.writeError("ERR TTL must be an integer number of seconds")
 		}
+		// Reject a non-positive TTL, and one so large that secs*Second would
+		// overflow time.Duration and wrap into a past deadline the sweeper
+		// would treat as already expired. Same guard as SETEX.
+		if secs <= 0 || secs > math.MaxInt64/int64(time.Second) {
+			return c.writeError("ERR invalid expire time in 'scache.set' command")
+		}
 		expireUnix = time.Now().Add(time.Duration(secs) * time.Second).Unix()
 	} else if len(args) != 3 {
 		return c.writeError("ERR syntax error")
@@ -51,8 +58,11 @@ func (c *conn) cmdSCacheSet(args []string) error {
 	if err != nil {
 		return c.writeError("ERR " + err.Error())
 	}
+	// The deadline lives on the vector item, where search skips it and the
+	// sweeper reclaims it. It stays in the meta JSON too so a snapshot written
+	// by this version still expires (lazily, on read) under an older binary.
 	meta, _ := json.Marshal(scacheMeta{Response: response, ExpireUnix: expireUnix})
-	if err := c.s.store.VSet(scacheCollection, prompt, vec, string(meta)); err != nil {
+	if err := c.s.store.VSet(scacheCollection, prompt, vec, string(meta), expireUnix); err != nil {
 		return c.storeErr(err)
 	}
 	return c.writeSimple("OK")
@@ -86,19 +96,23 @@ func (c *conn) cmdSCacheGet(args []string) error {
 	if err != nil {
 		return c.storeErr(err)
 	}
-	if len(results) == 0 || results[0].Score < threshold {
+	if len(results) == 0 {
 		c.s.stats.CacheMisses.Add(1)
 		return c.writeNull()
 	}
 
 	var meta scacheMeta
-	if err := json.Unmarshal([]byte(results[0].Item.Meta), &meta); err != nil {
+	metaOK := json.Unmarshal([]byte(results[0].Item.Meta), &meta) == nil
+	// Entries written before expiry lived on the vector item carry their
+	// deadline only in this JSON, invisible to search and the sweeper. Check
+	// it before the threshold so an expired entry is dropped even when it
+	// scores below the threshold; checking after would keep it forever.
+	if metaOK && meta.ExpireUnix != 0 && time.Now().Unix() > meta.ExpireUnix {
+		c.s.store.VDel(scacheCollection, results[0].Item.ID)
 		c.s.stats.CacheMisses.Add(1)
 		return c.writeNull()
 	}
-	if meta.ExpireUnix != 0 && time.Now().Unix() > meta.ExpireUnix {
-		// Expired: drop it and report a miss.
-		c.s.store.VDel(scacheCollection, results[0].Item.ID)
+	if !metaOK || results[0].Score < threshold {
 		c.s.stats.CacheMisses.Add(1)
 		return c.writeNull()
 	}
