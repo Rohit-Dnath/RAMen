@@ -105,6 +105,11 @@ func (s *Server) registerCommands() {
 		"ZCARD":         (*conn).cmdZCard,
 		"ZRANGE":        (*conn).cmdZRange,
 		"ZRANGEBYSCORE": (*conn).cmdZRangeByScore,
+		"ZINCRBY":       (*conn).cmdZIncrBy,
+		"ZRANK":         (*conn).cmdZRank,
+		"ZREVRANK":      (*conn).cmdZRevRank,
+		"ZREVRANGE":     (*conn).cmdZRevRange,
+		"ZCOUNT":        (*conn).cmdZCount,
 
 		// pub/sub
 		"SUBSCRIBE":   (*conn).cmdSubscribe,

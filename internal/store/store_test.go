@@ -708,3 +708,159 @@ func TestMSetNXConcurrent(t *testing.T) {
 		t.Fatalf("MSetNX torn write: %s=%q %s=%q, want one winner's mark on both", kx, vx, ky, vy)
 	}
 }
+
+func TestZIncrBy(t *testing.T) {
+	s := New()
+
+	// a new member on a missing key starts from 0
+	if sc, err := s.ZIncrBy("z", "a", 5); err != nil || sc != 5 {
+		t.Fatalf("ZIncrBy new = %v %v", sc, err)
+	}
+	if sc, err := s.ZIncrBy("z", "a", 2.5); err != nil || sc != 7.5 {
+		t.Fatalf("ZIncrBy existing = %v %v", sc, err)
+	}
+	if sc, _ := s.ZIncrBy("z", "a", -10); sc != -2.5 {
+		t.Fatalf("ZIncrBy negative = %v", sc)
+	}
+
+	// +inf plus -inf is NaN: error, and the score is left untouched
+	s.ZAdd("z", []ZMember{{Member: "big", Score: math.Inf(1)}})
+	if _, err := s.ZIncrBy("z", "big", math.Inf(-1)); err != ErrScoreNaN {
+		t.Fatalf("ZIncrBy NaN result = %v, want ErrScoreNaN", err)
+	}
+	if sc, _, _ := s.ZScore("z", "big"); !math.IsInf(sc, 1) {
+		t.Fatalf("ZIncrBy NaN modified the score = %v", sc)
+	}
+
+	// WRONGTYPE
+	s.Set("str", "v", SetOptions{})
+	if _, err := s.ZIncrBy("str", "a", 1); err != ErrWrongType {
+		t.Fatalf("ZIncrBy wrong type = %v", err)
+	}
+}
+
+func TestZRank(t *testing.T) {
+	s := New()
+	s.ZAdd("z", []ZMember{{"a", 1}, {"b", 2}, {"c", 3}})
+
+	for m, want := range map[string]int{"a": 0, "b": 1, "c": 2} {
+		if r, found, err := s.ZRank("z", m); err != nil || !found || r != want {
+			t.Fatalf("ZRank %s = %d found=%v err=%v, want %d", m, r, found, err, want)
+		}
+	}
+	for m, want := range map[string]int{"c": 0, "b": 1, "a": 2} {
+		if r, found, _ := s.ZRevRank("z", m); !found || r != want {
+			t.Fatalf("ZRevRank %s = %d found=%v, want %d", m, r, found, want)
+		}
+	}
+
+	// ties are broken lexicographically by member
+	s.ZAdd("t", []ZMember{{"y", 5}, {"x", 5}})
+	if r, _, _ := s.ZRank("t", "x"); r != 0 {
+		t.Fatalf("ZRank tie x = %d, want 0", r)
+	}
+	if r, _, _ := s.ZRank("t", "y"); r != 1 {
+		t.Fatalf("ZRank tie y = %d, want 1", r)
+	}
+
+	// missing member and missing key both report found=false
+	if _, found, _ := s.ZRank("z", "nope"); found {
+		t.Fatal("ZRank missing member should be found=false")
+	}
+	if _, found, _ := s.ZRevRank("nokey", "a"); found {
+		t.Fatal("ZRevRank missing key should be found=false")
+	}
+
+	// WRONGTYPE
+	s.Set("str", "v", SetOptions{})
+	if _, _, err := s.ZRank("str", "a"); err != ErrWrongType {
+		t.Fatalf("ZRank wrong type = %v", err)
+	}
+}
+
+func zmemberNames(ms []ZMember) []string {
+	out := make([]string, len(ms))
+	for i, m := range ms {
+		out[i] = m.Member
+	}
+	return out
+}
+
+func TestZRevRange(t *testing.T) {
+	s := New()
+	s.ZAdd("z", []ZMember{{"a", 1}, {"b", 2}, {"c", 3}})
+
+	// full reverse range: highest score first
+	r, err := s.ZRevRange("z", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(zmemberNames(r), ","); got != "c,b,a" {
+		t.Fatalf("ZRevRange 0 -1 = %q, want c,b,a", got)
+	}
+	// partial range
+	r, _ = s.ZRevRange("z", 0, 1)
+	if got := strings.Join(zmemberNames(r), ","); got != "c,b" {
+		t.Fatalf("ZRevRange 0 1 = %q, want c,b", got)
+	}
+	// start past the end -> empty; start > stop -> empty; missing key -> empty
+	if r, _ := s.ZRevRange("z", 5, 10); len(r) != 0 {
+		t.Fatalf("ZRevRange out-of-range = %v", r)
+	}
+	if r, _ := s.ZRevRange("z", 2, 1); len(r) != 0 {
+		t.Fatalf("ZRevRange start>stop = %v", r)
+	}
+	if r, _ := s.ZRevRange("nokey", 0, -1); len(r) != 0 {
+		t.Fatalf("ZRevRange missing = %v", r)
+	}
+
+	// equal scores break ties by REVERSE lexicographic order (Redis): ascending
+	// order is m,x,y, so descending must be y,x,m — not just the scores flipped.
+	s.ZAdd("t", []ZMember{{"x", 5}, {"y", 5}, {"m", 5}})
+	r, _ = s.ZRevRange("t", 0, -1)
+	if got := strings.Join(zmemberNames(r), ","); got != "y,x,m" {
+		t.Fatalf("ZRevRange tie order = %q, want y,x,m", got)
+	}
+
+	// WRONGTYPE
+	s.Set("str", "v", SetOptions{})
+	if _, err := s.ZRevRange("str", 0, -1); err != ErrWrongType {
+		t.Fatalf("ZRevRange wrong type = %v", err)
+	}
+}
+
+func TestZCount(t *testing.T) {
+	s := New()
+	s.ZAdd("z", []ZMember{{"a", 1}, {"b", 2}, {"c", 3}, {"d", 3}})
+	negInf, posInf := math.Inf(-1), math.Inf(1)
+
+	cases := []struct {
+		label   string
+		min     float64
+		minExcl bool
+		max     float64
+		maxExcl bool
+		want    int
+	}{
+		{"-inf..+inf", negInf, false, posInf, false, 4},
+		{"[2,3]", 2, false, 3, false, 3}, // b, c, d
+		{"(2,3]", 2, true, 3, false, 2},  // c, d
+		{"[2,3)", 2, false, 3, true, 1},  // b
+		{"(2,3)", 2, true, 3, true, 0},
+		{"[5,10]", 5, false, 10, false, 0},
+		{"min>max", 3, false, 1, false, 0},
+	}
+	for _, tc := range cases {
+		if n, err := s.ZCount("z", tc.min, tc.minExcl, tc.max, tc.maxExcl); err != nil || n != tc.want {
+			t.Fatalf("ZCount %s = %d (err %v), want %d", tc.label, n, err, tc.want)
+		}
+	}
+
+	if n, _ := s.ZCount("nokey", negInf, false, posInf, false); n != 0 {
+		t.Fatalf("ZCount missing key = %d", n)
+	}
+	s.Set("str", "v", SetOptions{})
+	if _, err := s.ZCount("str", 0, false, 10, false); err != ErrWrongType {
+		t.Fatalf("ZCount wrong type = %v", err)
+	}
+}

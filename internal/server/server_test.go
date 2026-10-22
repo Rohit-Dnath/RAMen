@@ -847,3 +847,173 @@ func TestMSetNX(t *testing.T) {
 	mustError(t, cli, "MSETNX", "k", "v", "k2") // dangling key
 	mustError(t, cli, "MSETNX")                 // nothing
 }
+
+func TestZIncrBy(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	if r := mustDo(t, cli, "ZINCRBY", "z", "5", "a"); r != "5" {
+		t.Fatalf("ZINCRBY new = %v", r)
+	}
+	if r := mustDo(t, cli, "ZINCRBY", "z", "2.5", "a"); r != "7.5" {
+		t.Fatalf("ZINCRBY existing = %v", r)
+	}
+	if r := mustDo(t, cli, "ZSCORE", "z", "a"); r != "7.5" {
+		t.Fatalf("ZSCORE after ZINCRBY = %v", r)
+	}
+
+	// an infinite score renders as Redis's "inf"/"-inf", not Go's "+Inf"
+	if r := mustDo(t, cli, "ZINCRBY", "z", "inf", "big"); r != "inf" {
+		t.Fatalf("ZINCRBY inf = %v, want inf", r)
+	}
+	// +inf then -inf on the same member is NaN -> error, and the score is kept
+	if e := mustError(t, cli, "ZINCRBY", "z", "-inf", "big"); e.Error() != "ERR resulting score is not a number (NaN)" {
+		t.Fatalf("ZINCRBY NaN error = %q", e.Error())
+	}
+	if r := mustDo(t, cli, "ZSCORE", "z", "big"); r != "inf" {
+		t.Fatalf("ZINCRBY NaN changed the score = %v", r)
+	}
+	// a non-float or NaN increment is an error
+	mustError(t, cli, "ZINCRBY", "z", "notanum", "a")
+	mustError(t, cli, "ZINCRBY", "z", "nan", "a")
+	// WRONGTYPE and arity
+	mustDo(t, cli, "SET", "str", "v")
+	mustError(t, cli, "ZINCRBY", "str", "1", "a")
+	mustError(t, cli, "ZINCRBY", "z", "1")
+}
+
+func TestZRank(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	mustDo(t, cli, "ZADD", "z", "1", "a", "2", "b", "3", "c")
+	if r := mustDo(t, cli, "ZRANK", "z", "a"); r != int64(0) {
+		t.Fatalf("ZRANK a = %v", r)
+	}
+	if r := mustDo(t, cli, "ZRANK", "z", "c"); r != int64(2) {
+		t.Fatalf("ZRANK c = %v", r)
+	}
+	if r := mustDo(t, cli, "ZREVRANK", "z", "a"); r != int64(2) {
+		t.Fatalf("ZREVRANK a = %v", r)
+	}
+	if r := mustDo(t, cli, "ZREVRANK", "z", "c"); r != int64(0) {
+		t.Fatalf("ZREVRANK c = %v", r)
+	}
+
+	// ties are broken lexicographically by member
+	mustDo(t, cli, "ZADD", "z2", "5", "y", "5", "x")
+	if r := mustDo(t, cli, "ZRANK", "z2", "x"); r != int64(0) {
+		t.Fatalf("ZRANK tie x = %v", r)
+	}
+	if r := mustDo(t, cli, "ZRANK", "z2", "y"); r != int64(1) {
+		t.Fatalf("ZRANK tie y = %v", r)
+	}
+
+	// missing member and missing key both return nil
+	if r, err := cli.Do("ZRANK", "z", "nope"); err != nil || r != nil {
+		t.Fatalf("ZRANK missing member = %v", r)
+	}
+	if r, err := cli.Do("ZREVRANK", "z", "nope"); err != nil || r != nil {
+		t.Fatalf("ZREVRANK missing member = %v", r)
+	}
+	if r, err := cli.Do("ZRANK", "nokey", "a"); err != nil || r != nil {
+		t.Fatalf("ZRANK missing key = %v", r)
+	}
+
+	// WRONGTYPE and arity
+	mustDo(t, cli, "SET", "str", "v")
+	mustError(t, cli, "ZRANK", "str", "a")
+	mustError(t, cli, "ZRANK", "z")
+}
+
+func TestZRevRange(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	mustDo(t, cli, "ZADD", "z", "1", "a", "2", "b", "3", "c")
+	// highest score first
+	r := mustDo(t, cli, "ZREVRANGE", "z", "0", "-1").([]any)
+	if len(r) != 3 || r[0] != "c" || r[1] != "b" || r[2] != "a" {
+		t.Fatalf("ZREVRANGE = %v", r)
+	}
+	// WITHSCORES interleaves member then score, for every element
+	r = mustDo(t, cli, "ZREVRANGE", "z", "0", "-1", "WITHSCORES").([]any)
+	if len(r) != 6 || r[0] != "c" || r[1] != "3" || r[2] != "b" || r[3] != "2" || r[4] != "a" || r[5] != "1" {
+		t.Fatalf("ZREVRANGE WITHSCORES = %v", r)
+	}
+	// negative indices count from the end
+	if r := mustDo(t, cli, "ZREVRANGE", "z", "-2", "-1").([]any); len(r) != 2 || r[0] != "b" || r[1] != "a" {
+		t.Fatalf("ZREVRANGE -2 -1 = %v", r)
+	}
+	// missing key -> empty
+	if r := mustDo(t, cli, "ZREVRANGE", "nokey", "0", "-1").([]any); len(r) != 0 {
+		t.Fatalf("ZREVRANGE missing = %v", r)
+	}
+
+	// errors
+	mustError(t, cli, "ZREVRANGE", "z", "0", "notanint")
+	mustError(t, cli, "ZREVRANGE", "z", "0", "-1", "BOGUS")
+	mustDo(t, cli, "SET", "str", "v")
+	mustError(t, cli, "ZREVRANGE", "str", "0", "-1")
+	mustError(t, cli, "ZREVRANGE", "z", "0")
+}
+
+func TestZCount(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	mustDo(t, cli, "ZADD", "z", "1", "a", "2", "b", "3", "c", "3", "d")
+
+	if r := mustDo(t, cli, "ZCOUNT", "z", "-inf", "+inf"); r != int64(4) {
+		t.Fatalf("ZCOUNT -inf +inf = %v", r)
+	}
+	if r := mustDo(t, cli, "ZCOUNT", "z", "2", "3"); r != int64(3) {
+		t.Fatalf("ZCOUNT 2 3 = %v", r)
+	}
+	// exclusive bounds with the ( prefix
+	if r := mustDo(t, cli, "ZCOUNT", "z", "(2", "3"); r != int64(2) {
+		t.Fatalf("ZCOUNT (2 3 = %v", r)
+	}
+	if r := mustDo(t, cli, "ZCOUNT", "z", "2", "(3"); r != int64(1) {
+		t.Fatalf("ZCOUNT 2 (3 = %v", r)
+	}
+	if r := mustDo(t, cli, "ZCOUNT", "z", "(2", "(3"); r != int64(0) {
+		t.Fatalf("ZCOUNT (2 (3 = %v", r)
+	}
+	// exclusive infinities still cover every finite score
+	if r := mustDo(t, cli, "ZCOUNT", "z", "(-inf", "(+inf"); r != int64(4) {
+		t.Fatalf("ZCOUNT (-inf (+inf = %v", r)
+	}
+	// missing key -> 0
+	if r := mustDo(t, cli, "ZCOUNT", "nokey", "-inf", "+inf"); r != int64(0) {
+		t.Fatalf("ZCOUNT missing = %v", r)
+	}
+
+	// errors
+	mustError(t, cli, "ZCOUNT", "z", "notafloat", "3")
+	mustError(t, cli, "ZCOUNT", "z", "nan", "3")
+	mustDo(t, cli, "SET", "str", "v")
+	mustError(t, cli, "ZCOUNT", "str", "0", "10")
+	mustError(t, cli, "ZCOUNT", "z", "0")
+}
+
+func TestZRangeByScoreInfinities(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	mustDo(t, cli, "ZADD", "z", "-inf", "lo", "5", "mid", "+inf", "hi")
+
+	// -inf..+inf must INCLUDE the infinite-scored members. A "+inf" bound used
+	// to map to the 1e308 sentinel, which is < +inf, so "hi" was dropped.
+	r := mustDo(t, cli, "ZRANGEBYSCORE", "z", "-inf", "+inf").([]any)
+	if len(r) != 3 || r[0] != "lo" || r[1] != "mid" || r[2] != "hi" {
+		t.Fatalf("ZRANGEBYSCORE -inf +inf = %v, want lo mid hi", r)
+	}
+	// a real 1e308 is a finite bound, so the +inf-scored "hi" is above it.
+	r2 := mustDo(t, cli, "ZRANGEBYSCORE", "z", "5", "1e308").([]any)
+	if len(r2) != 1 || r2[0] != "mid" {
+		t.Fatalf("ZRANGEBYSCORE 5 1e308 = %v, want mid", r2)
+	}
+	// a NaN bound is rejected rather than silently matching nothing.
+	mustError(t, cli, "ZRANGEBYSCORE", "z", "nan", "1")
+}

@@ -92,7 +92,19 @@ LINSERT q BEFORE b Z   # insert Z before the first "b"; returns new length, or -
 
 ## Sorted sets
 
-`ZADD`, `ZREM`, `ZSCORE`, `ZCARD`, `ZRANGE [WITHSCORES]`, `ZRANGEBYSCORE [WITHSCORES]`.
+| Command | Description |
+|---|---|
+| `ZADD <key> <score> <member> [score member ...]` | Add or update members; returns the number newly added. |
+| `ZREM <key> <member ...>` | Remove members; returns the number removed. |
+| `ZSCORE <key> <member>` | The member's score, or nil. |
+| `ZINCRBY <key> <increment> <member>` | Add `increment` to the member's score (creating it); returns the new score. |
+| `ZCARD <key>` | Number of members. |
+| `ZRANGE <key> <start> <stop> [WITHSCORES]` | Members in the rank range, lowest score first. |
+| `ZRANGEBYSCORE <key> <min> <max> [WITHSCORES]` | Members with a score in `[min, max]`. |
+| `ZRANK <key> <member>` | 0-based rank (lowest score first), or nil if missing. |
+| `ZREVRANK <key> <member>` | 0-based rank (highest score first), or nil if missing. |
+| `ZREVRANGE <key> <start> <stop> [WITHSCORES]` | Members in the rank range, highest score first. |
+| `ZCOUNT <key> <min> <max>` | Count members with a score in `[min, max]`; prefix a bound with `(` for exclusive, and `-inf`/`+inf` are allowed. |
 
 ```
 ZADD board 100 alice 250 bob
