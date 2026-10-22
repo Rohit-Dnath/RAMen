@@ -21,7 +21,7 @@ const shardCount = 256
 //	string                 -> string
 //	hash                   -> map[string]string
 //	list                   -> *list   (see list.go)
-//	set                    -> map[string]struct{}
+//	set                    -> *set     (see set.go)
 //	sorted set             -> *zset    (see zset.go)
 //	vector collection      -> *vector.Collection
 type value = any
@@ -143,7 +143,7 @@ func (s *Store) Type(key string) string {
 		return "hash"
 	case *list:
 		return "list"
-	case map[string]struct{}:
+	case *set:
 		return "set"
 	case *zset:
 		return "zset"

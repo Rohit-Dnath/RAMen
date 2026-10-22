@@ -13,8 +13,54 @@ var ErrSampleCount = errors.New("ERR value is out of range")
 // (with-repetition) count, guarding against an unbounded allocation.
 const maxSampleReps = 1 << 20
 
-func asSet(e *entry) (map[string]struct{}, error) {
-	st, ok := e.val.(map[string]struct{})
+// set holds its members in a slice, with idx mapping each member to its
+// position, so SPOP and SRANDMEMBER can pick a uniformly random member in O(1)
+// by index; a plain map can only be sampled by copying it. Removal moves the
+// last member into the freed slot, keeping add, remove and lookup O(1).
+type set struct {
+	idx   map[string]int
+	items []string
+}
+
+func newSet(capacity int) *set {
+	return &set{idx: make(map[string]int, capacity), items: make([]string, 0, capacity)}
+}
+
+func (st *set) len() int { return len(st.items) }
+
+func (st *set) has(m string) bool {
+	_, ok := st.idx[m]
+	return ok
+}
+
+func (st *set) add(m string) bool {
+	if _, ok := st.idx[m]; ok {
+		return false
+	}
+	st.idx[m] = len(st.items)
+	st.items = append(st.items, m)
+	return true
+}
+
+func (st *set) remove(m string) bool {
+	i, ok := st.idx[m]
+	if !ok {
+		return false
+	}
+	last := len(st.items) - 1
+	if i != last {
+		moved := st.items[last]
+		st.items[i] = moved
+		st.idx[moved] = i
+	}
+	st.items[last] = "" // drop the reference so the string can be collected
+	st.items = st.items[:last]
+	delete(st.idx, m)
+	return true
+}
+
+func asSet(e *entry) (*set, error) {
+	st, ok := e.val.(*set)
 	if !ok {
 		return nil, ErrWrongType
 	}
@@ -28,20 +74,19 @@ func (s *Store) SAdd(key string, members ...string) (int, error) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	e, found := sh.getLive(key, s.now())
-	var set map[string]struct{}
+	var st *set
 	if found {
 		var err error
-		if set, err = asSet(e); err != nil {
+		if st, err = asSet(e); err != nil {
 			return 0, err
 		}
 	} else {
-		set = make(map[string]struct{})
-		sh.m[key] = &entry{val: set}
+		st = newSet(len(members))
+		sh.m[key] = &entry{val: st}
 	}
 	added := 0
 	for _, m := range members {
-		if _, ok := set[m]; !ok {
-			set[m] = struct{}{}
+		if st.add(m) {
 			added++
 		}
 	}
@@ -58,18 +103,17 @@ func (s *Store) SRem(key string, members ...string) (int, error) {
 	if !found {
 		return 0, nil
 	}
-	set, err := asSet(e)
+	st, err := asSet(e)
 	if err != nil {
 		return 0, err
 	}
 	removed := 0
 	for _, m := range members {
-		if _, ok := set[m]; ok {
-			delete(set, m)
+		if st.remove(m) {
 			removed++
 		}
 	}
-	if len(set) == 0 {
+	if st.len() == 0 {
 		delete(sh.m, key)
 	}
 	return removed, nil
@@ -84,15 +128,11 @@ func (s *Store) SMembers(key string) ([]string, error) {
 	if !found {
 		return nil, nil
 	}
-	set, err := asSet(e)
+	st, err := asSet(e)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(set))
-	for m := range set {
-		out = append(out, m)
-	}
-	return out, nil
+	return append([]string(nil), st.items...), nil
 }
 
 // SIsMember reports whether member is in the set.
@@ -104,12 +144,11 @@ func (s *Store) SIsMember(key, member string) (bool, error) {
 	if !found {
 		return false, nil
 	}
-	set, err := asSet(e)
+	st, err := asSet(e)
 	if err != nil {
 		return false, err
 	}
-	_, ok := set[member]
-	return ok, nil
+	return st.has(member), nil
 }
 
 // SCard returns the set cardinality.
@@ -121,11 +160,11 @@ func (s *Store) SCard(key string) (int, error) {
 	if !found {
 		return 0, nil
 	}
-	set, err := asSet(e)
+	st, err := asSet(e)
 	if err != nil {
 		return 0, err
 	}
-	return len(set), nil
+	return st.len(), nil
 }
 
 // readSets returns a private copy of each key's set, or ErrWrongType if any key
@@ -145,13 +184,13 @@ func (s *Store) readSets(keys []string) ([]map[string]struct{}, error) {
 			sh.mu.RUnlock()
 			continue // leave out[i] nil, i.e. an empty set
 		}
-		set, err := asSet(e)
+		st, err := asSet(e)
 		if err != nil {
 			sh.mu.RUnlock()
 			return nil, err
 		}
-		cp := make(map[string]struct{}, len(set))
-		for m := range set {
+		cp := make(map[string]struct{}, st.len())
+		for _, m := range st.items {
 			cp[m] = struct{}{}
 		}
 		out[i] = cp
@@ -238,33 +277,38 @@ func (s *Store) SDiff(keys []string) ([]string, error) {
 	return out, nil
 }
 
-// sampleMembers picks members per Redis SPOP/SRANDMEMBER count rules: count >= 0
-// yields that many DISTINCT members (at most all of them); count < 0 yields
-// exactly -count members WITH repetition. members may be reordered in place.
-func sampleMembers(members []string, count int64) []string {
-	n := len(members)
-	if n == 0 || count == 0 {
-		return []string{}
-	}
-	if count > 0 {
-		if count >= int64(n) {
-			return append([]string(nil), members...)
+// sampleDistinct returns count (0 < count < len(items)) distinct members chosen
+// uniformly at random, without modifying items, in O(count) time: a small
+// sample draws random indexes and skips repeats, while a sample of more than
+// half the set (whose output is O(n) anyway) shuffles the first count slots of
+// a copy.
+func sampleDistinct(items []string, count int) []string {
+	n := len(items)
+	out := make([]string, 0, count)
+	if count <= n/2 {
+		// each draw repeats with probability < 1/2, so this takes < 2*count draws on average
+		seen := make(map[int]struct{}, count)
+		for len(out) < count {
+			i := rand.Intn(n)
+			if _, dup := seen[i]; dup {
+				continue
+			}
+			seen[i] = struct{}{}
+			out = append(out, items[i])
 		}
-		rand.Shuffle(n, func(i, j int) { members[i], members[j] = members[j], members[i] })
-		return append([]string(nil), members[:count]...)
+		return out
 	}
-	// count < 0: with repetition. The caller bounds the magnitude, so -count is
-	// safe to convert and cannot overflow.
-	reps := int(-count)
-	out := make([]string, reps)
-	for i := range out {
-		out[i] = members[rand.Intn(n)]
+	cp := append([]string(nil), items...)
+	for i := 0; i < count; i++ {
+		j := i + rand.Intn(n-i)
+		cp[i], cp[j] = cp[j], cp[i]
 	}
-	return out
+	return append(out, cp[:count]...)
 }
 
 // SPop removes and returns up to count random distinct members. The key is
 // deleted once emptied. count must be >= 0 (the caller rejects negatives).
+// Each pick is O(1), so popping count members costs O(count), not O(set size).
 func (s *Store) SPop(key string, count int64) ([]string, error) {
 	sh := s.shardFor(key)
 	sh.mu.Lock()
@@ -273,20 +317,22 @@ func (s *Store) SPop(key string, count int64) ([]string, error) {
 	if !found {
 		return nil, nil
 	}
-	set, err := asSet(e)
+	st, err := asSet(e)
 	if err != nil {
 		return nil, err
 	}
-	members := make([]string, 0, len(set))
-	for m := range set {
-		members = append(members, m)
+	if count == 0 {
+		return []string{}, nil
 	}
-	picked := sampleMembers(members, count)
-	for _, m := range picked {
-		delete(set, m)
-	}
-	if len(set) == 0 {
+	if count >= int64(st.len()) {
 		delete(sh.m, key)
+		return st.items, nil // the set is gone, so its slice can be handed over
+	}
+	picked := make([]string, count)
+	for i := range picked {
+		m := st.items[rand.Intn(st.len())]
+		st.remove(m)
+		picked[i] = m
 	}
 	return picked, nil
 }
@@ -303,7 +349,7 @@ func (s *Store) SRandMember(key string, count int64) ([]string, error) {
 	if !found {
 		return nil, nil
 	}
-	set, err := asSet(e)
+	st, err := asSet(e)
 	if err != nil {
 		return nil, err
 	}
@@ -312,9 +358,20 @@ func (s *Store) SRandMember(key string, count int64) ([]string, error) {
 	if count < -maxSampleReps {
 		return nil, ErrSampleCount
 	}
-	members := make([]string, 0, len(set))
-	for m := range set {
-		members = append(members, m)
+	n := st.len()
+	switch {
+	case count == 0:
+		return []string{}, nil
+	case count < 0:
+		// with repetition; the cap above makes -count safe to convert
+		out := make([]string, -count)
+		for i := range out {
+			out[i] = st.items[rand.Intn(n)]
+		}
+		return out, nil
+	case count >= int64(n):
+		return append([]string(nil), st.items...), nil
+	default:
+		return sampleDistinct(st.items, int(count)), nil
 	}
-	return sampleMembers(members, count), nil
 }

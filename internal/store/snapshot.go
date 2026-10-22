@@ -78,11 +78,9 @@ func (s *Store) Export() []Record {
 			case *list:
 				rec.Type = "list"
 				rec.List = append([]string(nil), v.items...)
-			case map[string]struct{}:
+			case *set:
 				rec.Type = "set"
-				for m := range v {
-					rec.Set = append(rec.Set, m)
-				}
+				rec.Set = append([]string(nil), v.items...)
 			case *zset:
 				rec.Type, rec.ZSet = "zset", v.sortedMembers()
 			case *vector.Collection:
@@ -143,11 +141,11 @@ func recordValue(rec Record, nowUnix int64) value {
 	case "list":
 		return &list{items: rec.List}
 	case "set":
-		set := make(map[string]struct{}, len(rec.Set))
+		st := newSet(len(rec.Set))
 		for _, m := range rec.Set {
-			set[m] = struct{}{}
+			st.add(m)
 		}
-		return set
+		return st
 	case "zset":
 		z := &zset{scores: make(map[string]float64, len(rec.ZSet))}
 		for _, m := range rec.ZSet {

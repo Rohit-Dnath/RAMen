@@ -2,6 +2,7 @@ package store
 
 import (
 	"math"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -1053,6 +1054,123 @@ func TestSetPopRandom(t *testing.T) {
 	}
 	if _, err := s.SRandMember("str", 1); err != ErrWrongType {
 		t.Fatalf("SRandMember wrong type = %v", err)
+	}
+}
+
+func TestSetIndexInvariant(t *testing.T) {
+	// Random adds and removes against a plain map: after every step each
+	// member's idx must point at its own slot, or a later swap-remove would
+	// corrupt the set.
+	rng := rand.New(rand.NewSource(1))
+	st := newSet(0)
+	ref := map[string]bool{}
+	for step := 0; step < 5000; step++ {
+		m := "m" + strconv.Itoa(rng.Intn(64))
+		if rng.Intn(2) == 0 {
+			if st.add(m) == ref[m] {
+				t.Fatalf("step %d: add(%s) disagreed with the reference", step, m)
+			}
+			ref[m] = true
+		} else {
+			if st.remove(m) != ref[m] {
+				t.Fatalf("step %d: remove(%s) disagreed with the reference", step, m)
+			}
+			delete(ref, m)
+		}
+		if st.len() != len(ref) || len(st.idx) != len(ref) {
+			t.Fatalf("step %d: len %d / idx %d, want %d", step, st.len(), len(st.idx), len(ref))
+		}
+		for i, item := range st.items {
+			if st.idx[item] != i || !ref[item] {
+				t.Fatalf("step %d: items[%d]=%s has idx %d (in ref: %v)", step, i, item, st.idx[item], ref[item])
+			}
+		}
+	}
+}
+
+func TestSetSamplingUniform(t *testing.T) {
+	// Every pick indexes the member slice uniformly, so each of 10 members
+	// should come up at its expected rate. The bounds sit 7+ standard
+	// deviations out, so this cannot flake, yet any positional bias (like
+	// taking the first key of a map range) lands far outside them.
+	s := New()
+	members := make([]string, 10)
+	for i := range members {
+		members[i] = "m" + strconv.Itoa(i)
+	}
+	s.SAdd("s", members...)
+	within := func(label string, counts map[string]int, want, tol int) {
+		t.Helper()
+		if len(counts) != len(members) {
+			t.Fatalf("%s: saw %d distinct members, want %d", label, len(counts), len(members))
+		}
+		for m, c := range counts {
+			if c < want-tol || c > want+tol {
+				t.Fatalf("%s: %s picked %d times, want %d±%d (%v)", label, m, c, want, tol, counts)
+			}
+		}
+	}
+
+	counts := map[string]int{}
+	for i := 0; i < 100000; i++ {
+		r, _ := s.SRandMember("s", 1)
+		counts[r[0]]++
+	}
+	within("SRANDMEMBER", counts, 10000, 1000)
+
+	counts = map[string]int{}
+	for i := 0; i < 50000; i++ {
+		r, _ := s.SPop("s", 1)
+		counts[r[0]]++
+		s.SAdd("s", r[0]) // put it back so the set stays at 10
+	}
+	within("SPOP", counts, 5000, 500)
+
+	// both sampleDistinct strategies: random draws (2 of 10) and partial shuffle (8 of 10)
+	for _, k := range []int64{2, 8} {
+		counts = map[string]int{}
+		for i := 0; i < 50000; i++ {
+			r, _ := s.SRandMember("s", k)
+			if int64(len(r)) != k || hasDup(r) {
+				t.Fatalf("SRANDMEMBER %d = %v, want %d distinct", k, r, k)
+			}
+			for _, m := range r {
+				counts[m]++
+			}
+		}
+		want := int(50000 * k / 10)
+		within("SRANDMEMBER "+strconv.FormatInt(k, 10), counts, want, want/10)
+	}
+	if n, _ := s.SCard("s"); n != 10 {
+		t.Fatalf("set ended with %d members, want 10", n)
+	}
+}
+
+// A single SPOP/SRANDMEMBER used to copy the whole set to pick one member.
+func BenchmarkSPopLargeSet(b *testing.B) {
+	s := New()
+	members := make([]string, 1_000_000)
+	for i := range members {
+		members[i] = "m" + strconv.Itoa(i)
+	}
+	s.SAdd("big", members...)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		popped, _ := s.SPop("big", 1)
+		s.SAdd("big", popped[0]) // keep the set at 1M
+	}
+}
+
+func BenchmarkSRandMemberLargeSet(b *testing.B) {
+	s := New()
+	members := make([]string, 1_000_000)
+	for i := range members {
+		members[i] = "m" + strconv.Itoa(i)
+	}
+	s.SAdd("big", members...)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.SRandMember("big", 1)
 	}
 }
 
