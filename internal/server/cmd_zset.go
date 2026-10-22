@@ -251,14 +251,24 @@ func parseScoreBound(s string) (float64, error) {
 	return v, nil
 }
 
+// formatFloat renders a score exactly as Redis replies with it (d2string in
+// util.c): whole numbers within ±2^62 print as plain integers, so a leaderboard
+// score of 1000000 is "1000000", not Go's "1e+06"; everything else goes through
+// the port of Redis's fpconv_dtoa in fpconv.go.
 func formatFloat(f float64) string {
 	switch {
+	case math.IsNaN(f):
+		return "nan"
 	case math.IsInf(f, 1):
 		return "inf"
 	case math.IsInf(f, -1):
 		return "-inf"
 	case f == 0:
-		return "0" // normalize -0 to 0, like Redis
+		// d2string itself would print "-0", but a sorted set's compact
+		// encoding drops the sign, so ZSCORE on -0 replies "0" in Redis
+		return "0"
+	case f >= -(1<<62) && f <= 1<<62 && f == math.Trunc(f):
+		return strconv.FormatInt(int64(f), 10)
 	}
-	return strconv.FormatFloat(f, 'g', -1, 64)
+	return fpconvDtoa(f)
 }

@@ -126,6 +126,10 @@ ZRANGE board 0 -1 WITHSCORES        # alice 100 bob 250
 ZRANGEBYSCORE board 150 +inf        # bob
 ```
 
+Scores are printed exactly as Redis prints them: whole numbers as plain digits
+(`1000000`, not `1e+06`), small and large values in Redis's own exponent form
+(`1e-7`, `1e+19`), and `inf`/`-inf` for infinities.
+
 ## Pub/Sub
 
 `SUBSCRIBE <channel ...>`, `UNSUBSCRIBE [channel ...]`, `PUBLISH <channel> <message>`.
