@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 )
 
 // ErrInvalidSyntax is returned when the byte stream is not valid RESP2.
@@ -17,6 +18,14 @@ var ErrInvalidSyntax = errors.New("resp: invalid syntax")
 
 // maxBulkLen caps a single bulk string at 512 MB, matching Redis' proto limit.
 const maxBulkLen = 512 * 1024 * 1024
+
+// maxArrayLen caps the number of arguments in one command, matching the
+// multibulk limit in Redis.
+const maxArrayLen = 1024 * 1024
+
+// maxPrealloc bounds how much we allocate up front on the strength of a
+// length the client has only claimed, not yet sent.
+const maxPrealloc = 1024 * 1024
 
 // Reader parses RESP2 values from a buffered stream.
 type Reader struct {
@@ -56,7 +65,10 @@ func (r *Reader) readArrayCommand() ([]string, error) {
 	if n < 0 {
 		return nil, nil // null array; treated as no command
 	}
-	args := make([]string, 0, n)
+	if n > maxArrayLen {
+		return nil, fmt.Errorf("%w: array too long", ErrInvalidSyntax)
+	}
+	args := make([]string, 0, min(n, 1024))
 	for i := int64(0); i < n; i++ {
 		typ, err := r.r.ReadByte()
 		if err != nil {
@@ -116,14 +128,53 @@ func (r *Reader) readBulkString() (string, error) {
 	if n > maxBulkLen {
 		return "", fmt.Errorf("%w: bulk string too long", ErrInvalidSyntax)
 	}
-	buf := make([]byte, n+2) // include trailing CRLF
-	if _, err := io.ReadFull(r.r, buf); err != nil {
-		return "", err
+	if n <= maxPrealloc {
+		buf := make([]byte, n+2) // include trailing CRLF
+		if _, err := io.ReadFull(r.r, buf); err != nil {
+			return "", err
+		}
+		if buf[n] != '\r' || buf[n+1] != '\n' {
+			return "", fmt.Errorf("%w: bulk string missing CRLF", ErrInvalidSyntax)
+		}
+		return string(buf[:n]), nil
 	}
-	if buf[n] != '\r' || buf[n+1] != '\n' {
+	return r.readLargeBulk(n)
+}
+
+// readLargeBulk reads an n-byte bulk body (plus CRLF) in fixed-size chunks so
+// memory is only committed as data actually arrives, then assembles the
+// string once.
+func (r *Reader) readLargeBulk(n int64) (string, error) {
+	chunks := make([][]byte, 0, 16)
+	for left := n; left > 0; {
+		c := make([]byte, min(left, maxPrealloc))
+		if _, err := io.ReadFull(r.r, c); err != nil {
+			return "", noEOF(err)
+		}
+		chunks = append(chunks, c)
+		left -= int64(len(c))
+	}
+	var crlf [2]byte
+	if _, err := io.ReadFull(r.r, crlf[:]); err != nil {
+		return "", noEOF(err)
+	}
+	if crlf != [2]byte{'\r', '\n'} {
 		return "", fmt.Errorf("%w: bulk string missing CRLF", ErrInvalidSyntax)
 	}
-	return string(buf[:n]), nil
+	var sb strings.Builder
+	sb.Grow(int(n))
+	for _, c := range chunks {
+		sb.Write(c)
+	}
+	return sb.String(), nil
+}
+
+// noEOF turns a bare EOF into ErrUnexpectedEOF: the stream ended mid-value.
+func noEOF(err error) error {
+	if err == io.EOF {
+		return io.ErrUnexpectedEOF
+	}
+	return err
 }
 
 // readInteger reads a number followed by CRLF.
