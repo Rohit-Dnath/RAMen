@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -1403,5 +1404,207 @@ func TestSCacheExpiry(t *testing.T) {
 	mustDo(t, cli, "SCACHE.SET", "p1", "cached answer", "TTL", "3600")
 	if r := mustDo(t, cli, "SCACHE.GET", "p1"); r != "cached answer" {
 		t.Fatalf("SCACHE.GET live = %v", r)
+	}
+}
+
+func TestSetBitGetBit(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// Setting bit 7 of a missing key creates one zero byte with its low bit on.
+	if r := mustDo(t, cli, "SETBIT", "k", "7", "1"); r != int64(0) {
+		t.Fatalf("SETBIT = %v, want old bit 0", r)
+	}
+	if r := mustDo(t, cli, "GET", "k"); r != "\x01" {
+		t.Fatalf("GET = %q, want \\x01", r)
+	}
+	if r := mustDo(t, cli, "SETBIT", "k", "7", "0"); r != int64(1) {
+		t.Fatalf("SETBIT clear = %v, want old bit 1", r)
+	}
+
+	// An offset past the end zero-extends the string.
+	mustDo(t, cli, "SET", "s", "a")
+	mustDo(t, cli, "SETBIT", "s", "23", "1")
+	if r := mustDo(t, cli, "GET", "s"); r != "a\x00\x01" {
+		t.Fatalf("GET after extend = %q, want a\\x00\\x01", r)
+	}
+
+	for _, c := range []struct {
+		key, off string
+		want     int64
+	}{
+		{"s", "1", 1}, // "a" = 01100001
+		{"s", "0", 0},
+		{"s", "23", 1},
+		{"s", "999", 0},   // past the end
+		{"nokey", "0", 0}, // missing key
+	} {
+		if r := mustDo(t, cli, "GETBIT", c.key, c.off); r != c.want {
+			t.Errorf("GETBIT %s %s = %v, want %d", c.key, c.off, r, c.want)
+		}
+	}
+
+	// SETBIT keeps an existing TTL.
+	mustDo(t, cli, "SET", "ttl", "x", "EX", "100")
+	mustDo(t, cli, "SETBIT", "ttl", "0", "1")
+	if r := mustDo(t, cli, "TTL", "ttl"); r.(int64) <= 0 {
+		t.Fatalf("TTL after SETBIT = %v, want it kept", r)
+	}
+
+	mustDo(t, cli, "RPUSH", "list", "a")
+	for _, args := range [][]string{
+		{"SETBIT", "k", "-1", "1"},
+		{"SETBIT", "k", "4294967296", "1"}, // 2^32: past 512 MB
+		{"SETBIT", "k", "x", "1"},
+		{"SETBIT", "k", "0", "2"},
+		{"SETBIT", "k", "+3", "1"},  // Redis rejects sign prefixes
+		{"SETBIT", "k", "007", "1"}, // and leading zeros
+		{"SETBIT", "k", "0", "01"},
+		{"GETBIT", "k", "-1"},
+		{"SETBIT", "list", "0", "1"},
+		{"GETBIT", "list", "0"},
+	} {
+		mustError(t, cli, args...)
+	}
+}
+
+func TestBitCount(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+	// Examples from the Redis BITCOUNT docs.
+	mustDo(t, cli, "SET", "k", "foobar")
+	for _, c := range []struct {
+		args []string
+		want int64
+	}{
+		{[]string{"k"}, 26},
+		{[]string{"k", "0", "0"}, 4},
+		{[]string{"k", "1", "1"}, 6},
+		{[]string{"k", "1", "1", "BYTE"}, 6},
+		{[]string{"k", "5", "30", "BIT"}, 17},
+		{[]string{"k", "-2", "-1"}, 7}, // "ar"
+		{[]string{"k", "0", "-1", "bit"}, 26},
+		{[]string{"k", "3", "1"}, 0}, // start > end
+		{[]string{"nokey"}, 0},
+	} {
+		args := append([]string{"BITCOUNT"}, c.args...)
+		if r := mustDo(t, cli, args...); r != c.want {
+			t.Errorf("%v = %v, want %d", args, r, c.want)
+		}
+	}
+	mustDo(t, cli, "RPUSH", "list", "a")
+	for _, args := range [][]string{
+		{"BITCOUNT", "k", "0"},
+		{"BITCOUNT", "k", "0", "x"},
+		{"BITCOUNT", "k", "+0", "1"},
+		{"BITCOUNT", "k", "0", "1", "WORD"},
+		{"BITCOUNT", "list"},
+	} {
+		mustError(t, cli, args...)
+	}
+}
+
+func TestBitOp(t *testing.T) {
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+	mustDo(t, cli, "SET", "k", "a")    // 01100001
+	mustDo(t, cli, "SET", "l", "\x8a") // 10001010
+	mustDo(t, cli, "SET", "m", "\xff\xff")
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"AND", "k", "l"}, "\x00"},
+		{[]string{"OR", "k", "l"}, "\xeb"},
+		{[]string{"XOR", "k", "k"}, "\x00"},
+		{[]string{"XOR", "k", "m"}, "\x9e\xff"}, // k zero-padded to 2 bytes
+		{[]string{"AND", "m", "k"}, "a\x00"},
+		{[]string{"NOT", "k"}, "\x9e"},
+		{[]string{"or", "k", "nokey"}, "a"}, // lowercase op, missing source
+	} {
+		args := append([]string{"BITOP", c.args[0], "dest"}, c.args[1:]...)
+		if r := mustDo(t, cli, args...); r != int64(len(c.want)) {
+			t.Errorf("%v = %v, want length %d", args, r, len(c.want))
+		}
+		if r := mustDo(t, cli, "GET", "dest"); r != c.want {
+			t.Errorf("%v stored %q, want %q", args, r, c.want)
+		}
+	}
+
+	// dest is overwritten whatever its type, and loses its TTL.
+	mustDo(t, cli, "RPUSH", "list", "a")
+	mustDo(t, cli, "BITOP", "OR", "list", "k")
+	if r := mustDo(t, cli, "GET", "list"); r != "a" {
+		t.Fatalf("GET list after BITOP = %v, want a", r)
+	}
+	mustDo(t, cli, "SET", "ttl", "x", "EX", "100")
+	mustDo(t, cli, "BITOP", "OR", "ttl", "k")
+	if r := mustDo(t, cli, "TTL", "ttl"); r != int64(-1) {
+		t.Fatalf("TTL after BITOP = %v, want -1", r)
+	}
+
+	// All sources missing: dest is deleted.
+	if r := mustDo(t, cli, "BITOP", "AND", "dest", "no1", "no2"); r != int64(0) {
+		t.Fatalf("BITOP on missing keys = %v, want 0", r)
+	}
+	if r := mustDo(t, cli, "EXISTS", "dest"); r != int64(0) {
+		t.Fatalf("EXISTS dest = %v, want 0", r)
+	}
+
+	mustDo(t, cli, "RPUSH", "list2", "a")
+	for _, args := range [][]string{
+		{"BITOP", "NOT", "dest", "k", "l"},
+		{"BITOP", "NAND", "dest", "k"},
+		{"BITOP", "AND", "dest"},
+		{"BITOP", "OR", "dest", "k", "list2"},
+	} {
+		mustError(t, cli, args...)
+	}
+}
+
+// TestBitmapMaxSize exercises a bitmap at the 512 MB limit: the last valid
+// bit, counts at both ends, and BITOP NOT across the whole value.
+//
+// It is off by default because it peaks at about 1.6 GB of memory (two 512 MB
+// values plus copies made while building them) and takes a few seconds, which
+// may be too much for CI or small machines. Run it with:
+//
+//	RAMEN_BIG_TESTS=1 go test -run TestBitmapMaxSize ./internal/server
+func TestBitmapMaxSize(t *testing.T) {
+	if os.Getenv("RAMEN_BIG_TESTS") == "" {
+		t.Skip("needs ~1.6 GB of memory; set RAMEN_BIG_TESTS=1 to run")
+	}
+	cli, cleanup := startTestServer(t)
+	defer cleanup()
+
+	const lastBit = "4294967295" // 512 MB * 8 - 1
+	if r := mustDo(t, cli, "SETBIT", "big", lastBit, "1"); r != int64(0) {
+		t.Fatalf("SETBIT last bit = %v, want 0", r)
+	}
+	for _, c := range []struct {
+		args []string
+		want int64
+	}{
+		{[]string{"STRLEN", "big"}, 536870912},
+		{[]string{"GETBIT", "big", lastBit}, 1},
+		{[]string{"GETBIT", "big", "0"}, 0},
+		{[]string{"BITCOUNT", "big"}, 1},
+		{[]string{"BITCOUNT", "big", "-1", "-1"}, 1},
+		{[]string{"BITCOUNT", "big", "4294967290", "-1", "BIT"}, 1},
+		{[]string{"BITCOUNT", "big", "0", "-2"}, 0},
+		{[]string{"BITOP", "NOT", "inv", "big"}, 536870912},
+		{[]string{"BITCOUNT", "inv"}, 4294967295}, // every bit but one
+		{[]string{"GETBIT", "inv", lastBit}, 0},
+	} {
+		if r := mustDo(t, cli, c.args...); r != c.want {
+			t.Errorf("%v = %v, want %d", c.args, r, c.want)
+		}
+	}
+
+	// One bit past the limit is rejected and the server stays up.
+	mustError(t, cli, "SETBIT", "big", "4294967296", "1")
+	mustError(t, cli, "GETBIT", "big", "4294967296")
+	if r := mustDo(t, cli, "PING"); r != "PONG" {
+		t.Fatalf("PING = %v, want PONG", r)
 	}
 }

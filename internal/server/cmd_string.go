@@ -348,3 +348,116 @@ func (c *conn) cmdSetRange(args []string) error {
 	}
 	return c.writeInt(int64(n))
 }
+
+// parseStrictInt parses s as an int64 the way Redis does: no sign prefix,
+// leading zeros or spaces, so "+3" and "007" are rejected.
+func parseStrictInt(s string) (int64, bool) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || strconv.FormatInt(n, 10) != s {
+		return 0, false
+	}
+	return n, true
+}
+
+// parseBitOffset parses a SETBIT/GETBIT offset, which must address a bit
+// inside a maxStringSize string.
+func parseBitOffset(s string) (int64, bool) {
+	n, ok := parseStrictInt(s)
+	if !ok || n < 0 || n>>3 >= maxStringSize {
+		return 0, false
+	}
+	return n, true
+}
+
+func (c *conn) cmdSetBit(args []string) error {
+	if len(args) != 4 {
+		return c.wrongArgs("setbit")
+	}
+	offset, ok := parseBitOffset(args[2])
+	if !ok {
+		return c.writeError("ERR bit offset is not an integer or out of range")
+	}
+	if args[3] != "0" && args[3] != "1" {
+		return c.writeError("ERR bit is not an integer or out of range")
+	}
+	old, err := c.s.store.SetBit(args[1], offset, args[3] == "1")
+	if err != nil {
+		return c.storeErr(err)
+	}
+	return c.writeInt(int64(old))
+}
+
+func (c *conn) cmdGetBit(args []string) error {
+	if len(args) != 3 {
+		return c.wrongArgs("getbit")
+	}
+	offset, ok := parseBitOffset(args[2])
+	if !ok {
+		return c.writeError("ERR bit offset is not an integer or out of range")
+	}
+	bit, err := c.s.store.GetBit(args[1], offset)
+	if err != nil {
+		return c.storeErr(err)
+	}
+	return c.writeInt(int64(bit))
+}
+
+func (c *conn) cmdBitCount(args []string) error {
+	if len(args) < 2 {
+		return c.wrongArgs("bitcount")
+	}
+	start, end, bitUnit := int64(0), int64(-1), false
+	switch len(args) {
+	case 2:
+	case 4, 5:
+		var ok1, ok2 bool
+		start, ok1 = parseStrictInt(args[2])
+		end, ok2 = parseStrictInt(args[3])
+		if !ok1 || !ok2 {
+			return c.writeError(store.ErrNotInteger.Error())
+		}
+		if len(args) == 5 {
+			switch strings.ToUpper(args[4]) {
+			case "BYTE":
+			case "BIT":
+				bitUnit = true
+			default:
+				return c.writeError("ERR syntax error")
+			}
+		}
+	default:
+		return c.writeError("ERR syntax error")
+	}
+	n, err := c.s.store.BitCount(args[1], start, end, bitUnit)
+	if err != nil {
+		return c.storeErr(err)
+	}
+	return c.writeInt(n)
+}
+
+func (c *conn) cmdBitOp(args []string) error {
+	if len(args) < 4 {
+		return c.wrongArgs("bitop")
+	}
+	var op store.BitOpKind
+	switch strings.ToUpper(args[1]) {
+	case "AND":
+		op = store.BitAnd
+	case "OR":
+		op = store.BitOr
+	case "XOR":
+		op = store.BitXor
+	case "NOT":
+		op = store.BitNot
+		if len(args) != 4 {
+			return c.writeError("ERR BITOP NOT must be called with a single source key.")
+		}
+	default:
+		return c.writeError("ERR syntax error")
+	}
+	n, err := c.s.store.BitOp(op, args[2], args[3:])
+	if err != nil {
+		return c.storeErr(err)
+	}
+	return c.writeInt(int64(n))
+}

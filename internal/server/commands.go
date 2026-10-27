@@ -66,6 +66,10 @@ func (s *Server) registerCommands() {
 		"MGET":        (*conn).cmdMGet,
 		"MSET":        (*conn).cmdMSet,
 		"MSETNX":      (*conn).cmdMSetNX,
+		"SETBIT":      (*conn).cmdSetBit,
+		"GETBIT":      (*conn).cmdGetBit,
+		"BITCOUNT":    (*conn).cmdBitCount,
+		"BITOP":       (*conn).cmdBitOp,
 
 		// hashes
 		"HSET":         (*conn).cmdHSet,

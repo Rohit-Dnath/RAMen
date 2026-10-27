@@ -1494,3 +1494,41 @@ func TestVectorExpirySnapshot(t *testing.T) {
 		t.Fatal("an all-expired collection loaded as an empty key")
 	}
 }
+
+// TestBitOpConcurrent runs BITOP over overlapping keys in every order while
+// SETBIT writes to them. Shards must be locked in a fixed order, or two BITOPs
+// with swapped keys deadlock; run with -race to also catch unlocked access.
+func TestBitOpConcurrent(t *testing.T) {
+	s := New()
+	keys := []string{"a", "b", "c", "d", "e", "f"}
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(int64(g)))
+			for i := 0; i < 2000; i++ {
+				k := keys[r.Intn(len(keys))]
+				if r.Intn(2) == 0 {
+					if _, err := s.SetBit(k, int64(r.Intn(256)), r.Intn(2) == 0); err != nil {
+						t.Error(err)
+						return
+					}
+					continue
+				}
+				srcs := []string{keys[r.Intn(len(keys))], keys[r.Intn(len(keys))]}
+				if _, err := s.BitOp(BitOpKind(r.Intn(3)), k, srcs); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}(g)
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("BITOP deadlocked")
+	}
+}

@@ -61,6 +61,10 @@ conventions; arguments in `<>` are required, `[]` optional. RAMen is single
 | `MGET <key> [key ...]` | Multiple gets. |
 | `MSET <key> <val> [key val ...]` | Multiple sets. |
 | `MSETNX <key> <val> [key val ...]` | Set all pairs only if none of the keys exist; `1` if set, `0` otherwise. |
+| `SETBIT <key> <offset> <0\|1>` | Set or clear one bit (bit 0 is the high bit of the first byte), zero-padding past the end; returns the old bit. |
+| `GETBIT <key> <offset>` | Read one bit; `0` past the end or for a missing key. |
+| `BITCOUNT <key> [start end [BYTE\|BIT]]` | Count set bits, optionally in a byte (default) or bit range; negative indexes count from the end. |
+| `BITOP <AND\|OR\|XOR\|NOT> <dest> <key> [key ...]` | Combine strings bit by bit into `dest`, zero-padding shorter ones; returns the result length. `NOT` takes one key. |
 
 ## Hashes
 

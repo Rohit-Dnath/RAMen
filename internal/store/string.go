@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"math"
+	"math/bits"
 	"strconv"
 	"time"
 )
@@ -357,5 +358,202 @@ func (s *Store) SetRange(key string, offset int, val string) (int, error) {
 	} else {
 		sh.m[key] = &entry{val: string(buf)}
 	}
+	return size, nil
+}
+
+// BitOpKind selects the operation BitOp applies.
+type BitOpKind int
+
+const (
+	BitAnd BitOpKind = iota
+	BitOr
+	BitXor
+	BitNot
+)
+
+// SetBit sets the bit at offset to on and returns the bit's previous value.
+// Bit 0 is the most significant bit of the first byte, as in Redis. The
+// string is zero-padded when offset lies past its end, and any TTL is kept.
+func (s *Store) SetBit(key string, offset int64, on bool) (int, error) {
+	sh := s.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	var cur string
+	e, found := sh.getLive(key, s.now())
+	if found {
+		str, err := asString(e)
+		if err != nil {
+			return 0, err
+		}
+		cur = str
+	}
+	idx := int(offset >> 3)
+	mask := byte(0x80) >> (offset & 7)
+	size := max(len(cur), idx+1)
+	buf := make([]byte, size)
+	copy(buf, cur)
+	old := 0
+	if buf[idx]&mask != 0 {
+		old = 1
+	}
+	if on {
+		buf[idx] |= mask
+	} else {
+		buf[idx] &^= mask
+	}
+	if found {
+		e.val = string(buf)
+	} else {
+		sh.m[key] = &entry{val: string(buf)}
+	}
+	return old, nil
+}
+
+// GetBit returns the bit at offset. A missing key, or an offset past the end
+// of the string, reads as 0.
+func (s *Store) GetBit(key string, offset int64) (int, error) {
+	str, _, err := s.Get(key)
+	if err != nil {
+		return 0, err
+	}
+	idx := offset >> 3
+	if idx >= int64(len(str)) {
+		return 0, nil
+	}
+	if str[idx]&(byte(0x80)>>(offset&7)) != 0 {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+// BitCount counts the set bits between start and end (inclusive), with
+// GETRANGE-style negative offsets and clamping. The range is in bytes, or in
+// bits when bitUnit is set. Pass 0, -1 to count the whole string.
+func (s *Store) BitCount(key string, start, end int64, bitUnit bool) (int64, error) {
+	str, _, err := s.Get(key)
+	if err != nil {
+		return 0, err
+	}
+	n := int64(len(str))
+	if bitUnit {
+		n *= 8
+	}
+	// Redis checks this before clamping: e.g. -1 -3 is an empty range even
+	// on a short string, where both would otherwise clamp to 0.
+	if start < 0 && end < 0 && start > end {
+		return 0, nil
+	}
+	if start < 0 {
+		start += n
+	}
+	if end < 0 {
+		end += n
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end < 0 {
+		end = 0
+	}
+	if end >= n {
+		end = n - 1
+	}
+	if start > end {
+		return 0, nil
+	}
+	if !bitUnit {
+		var count int64
+		for i := start; i <= end; i++ {
+			count += int64(bits.OnesCount8(str[i]))
+		}
+		return count, nil
+	}
+	// Bit range: mask off the bits outside [start, end] in the first and
+	// last bytes, count whole bytes in between.
+	first, last := start>>3, end>>3
+	var count int64
+	for i := first; i <= last; i++ {
+		b := str[i]
+		if i == first {
+			b &= 0xff >> (start & 7)
+		}
+		if i == last {
+			b &= 0xff << (7 - end&7)
+		}
+		count += int64(bits.OnesCount8(b))
+	}
+	return count, nil
+}
+
+// BitOp combines the strings at keys bit by bit and stores the result at
+// dest, returning its length. Shorter (or missing) sources are treated as
+// zero-padded to the longest. dest is overwritten whatever its type and loses
+// any TTL; when the result is empty dest is deleted instead. BitNot takes
+// exactly one key; the caller enforces that.
+func (s *Store) BitOp(op BitOpKind, dest string, keys []string) (int, error) {
+	// Lock every involved shard once, in shard order, like MSetNX, so the
+	// sources and dest are read and written as one atomic step.
+	destSh := s.shardFor(dest)
+	involved := map[*shard]bool{destSh: true}
+	for _, k := range keys {
+		involved[s.shardFor(k)] = true
+	}
+	for _, sh := range s.shards {
+		if involved[sh] {
+			sh.mu.Lock()
+		}
+	}
+	defer func() {
+		for _, sh := range s.shards {
+			if involved[sh] {
+				sh.mu.Unlock()
+			}
+		}
+	}()
+
+	now := s.now()
+	srcs := make([]string, len(keys))
+	size := 0
+	for i, k := range keys {
+		e, found := s.shardFor(k).getLive(k, now)
+		if !found {
+			continue
+		}
+		str, err := asString(e)
+		if err != nil {
+			return 0, err
+		}
+		srcs[i] = str
+		size = max(size, len(str))
+	}
+	if size == 0 {
+		delete(destSh.m, dest)
+		return 0, nil
+	}
+
+	out := make([]byte, size)
+	copy(out, srcs[0])
+	if op == BitNot {
+		for i := range out {
+			out[i] = ^out[i]
+		}
+	}
+	for _, src := range srcs[1:] {
+		for i := range out {
+			var b byte // past the end of src reads as zero
+			if i < len(src) {
+				b = src[i]
+			}
+			switch op {
+			case BitAnd:
+				out[i] &= b
+			case BitOr:
+				out[i] |= b
+			case BitXor:
+				out[i] ^= b
+			}
+		}
+	}
+	destSh.m[dest] = &entry{val: string(out)}
 	return size, nil
 }
